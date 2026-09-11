@@ -3,7 +3,7 @@ package core_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"slices"
 	"testing"
@@ -120,7 +120,11 @@ func TestTableInfo(t *testing.T) {
 		t.Run(fmt.Sprintf("%d_%s", i, s.tableName), func(t *testing.T) {
 			rows, _ := app.TableInfo(s.tableName)
 
-			raw, err := json.Marshal(rows)
+			raw, err := json.Marshal(
+				rows,
+				json.Deterministic(true),
+				json.FormatNilSliceAsNull(true),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -202,10 +206,10 @@ func TestVacuum(t *testing.T) {
 	defer app.Cleanup()
 
 	calledQueries := []string{}
-	app.DB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
+	app.NonconcurrentDB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
-	app.DB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
+	app.NonconcurrentDB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
 
@@ -229,10 +233,10 @@ func TestAuxVacuum(t *testing.T) {
 	defer app.Cleanup()
 
 	calledQueries := []string{}
-	app.AuxDB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
+	app.AuxNonconcurrentDB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
-	app.AuxDB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
+	app.AuxNonconcurrentDB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
 

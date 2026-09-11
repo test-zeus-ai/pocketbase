@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/pocketbase/dbx"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core/validators"
 	"github.com/pocketbase/pocketbase/tools/dbutils"
 	"github.com/pocketbase/pocketbase/tools/list"
@@ -34,7 +34,11 @@ func onCollectionValidate(e *CollectionEvent) error {
 		original,
 	)
 
-	return validator.run()
+	if err := validator.run(); err != nil {
+		return err
+	}
+
+	return e.Next()
 }
 
 func newCollectionValidator(ctx context.Context, app App, new, original *Collection) *collectionValidator {
@@ -83,7 +87,7 @@ func (validator *collectionValidator) run() error {
 				validator.original.IsNew(),
 				validation.Length(1, 100),
 				validation.Match(DefaultIdRegex),
-				validation.By(validators.UniqueId(validator.app.DB(), validator.new.TableName())),
+				validation.By(validators.UniqueId(validator.app.ConcurrentDB(), validator.new.TableName())),
 			).Else(
 				validation.By(validators.Equal(validator.original.Id)),
 			),
@@ -310,11 +314,15 @@ func (cv *collectionValidator) checkViewQuery(value any) error {
 		return nil // nothing to check
 	}
 
-	if _, err := cv.app.CreateViewFields(v); err != nil {
-		return validation.NewError(
-			"validation_invalid_view_query",
-			fmt.Sprintf("Invalid query - %s", err.Error()),
-		)
+	_, err := cv.app.DryRunView(v, 10)
+	if err != nil {
+		rawErr := err.Error()
+		if len(rawErr) > 500 {
+			// restrict just as an extra precaution
+			rawErr = rawErr[:500]
+		}
+
+		return validation.NewError("validation_invalid_view_query", "Invalid query - "+rawErr)
 	}
 
 	return nil
@@ -485,7 +493,7 @@ func (validator *collectionValidator) checkRule(value any) error {
 		return nil // nothing to check
 	}
 
-	r := NewRecordFieldResolver(validator.app, validator.new, nil, true)
+	r := NewRecordFieldResolver(validator.app, validator.new, &RequestInfo{}, true)
 	_, err := search.FilterData(vStr).BuildExpr(r)
 	if err != nil {
 		return validation.NewError("validation_invalid_rule", "Invalid rule. Raw error: "+err.Error())
@@ -554,7 +562,7 @@ func (cv *collectionValidator) checkIndexes(value any) error {
 
 		// ensure that the index name is not used in another collection
 		var usedTblName string
-		_ = cv.app.DB().Select("tbl_name").
+		_ = cv.app.ConcurrentDB().Select("tbl_name").
 			From("sqlite_master").
 			AndWhere(dbx.HashExp{"type": "index"}).
 			AndWhere(dbx.NewExp("LOWER([[tbl_name]])!=LOWER({:oldName})", dbx.Params{"oldName": cv.original.Name})).

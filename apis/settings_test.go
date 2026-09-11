@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 )
 
@@ -58,6 +59,32 @@ func TestSettingsList(t *testing.T) {
 				"OnSettingsListRequest": 1,
 			},
 		},
+		{
+			Name:   "OnSettingsListRequest tx body write check",
+			Method: http.MethodGet,
+			URL:    "/api/settings",
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				app.OnSettingsListRequest().BindFunc(func(e *core.SettingsListRequestEvent) error {
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
+				})
+			},
+			ExpectedStatus:  400,
+			ExpectedEvents:  map[string]int{"OnSettingsListRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
+		},
 	}
 
 	for _, scenario := range scenarios {
@@ -70,8 +97,9 @@ func TestSettingsSet(t *testing.T) {
 
 	validData := `{
 		"meta":{"appName":"update_test"},
-		"s3":{"secret": "s3_secret"},
-		"backups":{"s3":{"secret":"backups_s3_secret"}}
+		"smtp":{"password": "new_smtp_password"},
+		"s3":{"secret": "new_s3_secret"},
+		"backups":{"s3":{"secret":"new_backups_s3_secret"}}
 	}`
 
 	scenarios := []tests.ApiScenario{
@@ -152,6 +180,25 @@ func TestSettingsSet(t *testing.T) {
 			Headers: map[string]string{
 				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
 			},
+			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+				settings := app.Settings()
+
+				// verify that the secret values are persisted
+				secrets := map[string]struct {
+					current  string
+					expected string
+				}{
+					"smtp.password":     {settings.SMTP.Password, "new_smtp_password"},
+					"s3.secret":         {settings.S3.Secret, "new_s3_secret"},
+					"backups.s3.secret": {settings.Backups.S3.Secret, "new_backups_s3_secret"},
+				}
+
+				for name, secret := range secrets {
+					if secret.current != secret.expected {
+						t.Errorf("[%s] expected secret %q, got %q", name, secret.expected, secret.current)
+					}
+				}
+			},
 			ExpectedStatus: 200,
 			ExpectedContent: []string{
 				`"meta":{`,
@@ -175,6 +222,33 @@ func TestSettingsSet(t *testing.T) {
 				"OnModelValidate":           1,
 				"OnSettingsReload":          1,
 			},
+		},
+		{
+			Name:   "OnSettingsUpdateRequest tx body write check",
+			Method: http.MethodPatch,
+			URL:    "/api/settings",
+			Body:   strings.NewReader(validData),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				app.OnSettingsUpdateRequest().BindFunc(func(e *core.SettingsUpdateRequestEvent) error {
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
+				})
+			},
+			ExpectedStatus:  400,
+			ExpectedEvents:  map[string]int{"OnSettingsUpdateRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 	}
 

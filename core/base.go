@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -26,6 +25,8 @@ import (
 	"github.com/pocketbase/pocketbase/tools/store"
 	"github.com/pocketbase/pocketbase/tools/subscriptions"
 	"github.com/pocketbase/pocketbase/tools/types"
+	"github.com/spf13/cast"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -37,8 +38,15 @@ const (
 
 	LocalStorageDirName       string = "storage"
 	LocalBackupsDirName       string = "backups"
-	LocalTempDirName          string = ".pb_temp_to_delete" // temp pb_data sub directory that will be deleted on each app.Bootstrap()
 	LocalAutocertCacheDirName string = ".autocert_cache"
+	LocalNotifyDirName        string = ".notify"            // optional watched directory that is used as a cross-platform workaround for synchronizing various runtime states between multiple PocketBase instances pointing to the same pb_data
+	LocalTempDirName          string = ".pb_temp_to_delete" // temp pb_data sub directory that will be deleted on each app.Bootstrap()
+
+	// @todo consider removing after backups refactoring
+	lostFoundDirName string = "lost+found"
+
+	dataDBFilename string = "data.db"
+	auxDBFilename  string = "auxiliary.db"
 )
 
 // FilesManager defines an interface with common methods that files manager models should implement.
@@ -69,7 +77,7 @@ var _ App = (*BaseApp)(nil)
 // BaseApp implements core.App and defines the base PocketBase app structure.
 type BaseApp struct {
 	config              *BaseAppConfig
-	txInfo              *txAppInfo
+	txInfo              *TxAppInfo
 	store               *store.Store[string, any]
 	cron                *cron.Cron
 	settings            *Settings
@@ -140,6 +148,17 @@ type BaseApp struct {
 	onMailerRecordEmailChangeSend   *hook.Hook[*MailerRecordEvent]
 	onMailerRecordOTPSend           *hook.Hook[*MailerRecordEvent]
 	onMailerRecordAuthAlertSend     *hook.Hook[*MailerRecordEvent]
+
+	// filesystem event hooks
+	//
+	// @todo 1:
+	// intentionally not exposed since the events are too "chatty" and
+	// can cause unnecessary userland tests breaking changes;
+	// reevaluate once refactoring the file_field
+	//
+	// @todo 2: if exposed consider registering the same for the backup filesystem
+	_onFilesystemNewWriter *hook.Hook[*FilesystemNewWriterEvent]
+	_onFilesystemDelete    *hook.Hook[*FilesystemDeleteEvent]
 
 	// realtime api event hooks
 	onRealtimeConnectRequest   *hook.Hook[*RealtimeConnectRequestEvent]
@@ -289,6 +308,10 @@ func (app *BaseApp) initHooks() {
 	app.onMailerRecordOTPSend = &hook.Hook[*MailerRecordEvent]{}
 	app.onMailerRecordAuthAlertSend = &hook.Hook[*MailerRecordEvent]{}
 
+	// filesystem event hooks
+	app._onFilesystemNewWriter = &hook.Hook[*FilesystemNewWriterEvent]{}
+	app._onFilesystemDelete = &hook.Hook[*FilesystemDeleteEvent]{}
+
 	// realtime API event hooks
 	app.onRealtimeConnectRequest = &hook.Hook[*RealtimeConnectRequestEvent]{}
 	app.onRealtimeMessageSend = &hook.Hook[*RealtimeMessageEvent]{}
@@ -360,9 +383,17 @@ func (app *BaseApp) Logger() *slog.Logger {
 	return app.logger
 }
 
+// TxInfo returns the transaction associated with the current app instance (if any).
+//
+// Could be used if you want to execute indirectly a function after
+// the related app transaction completes using `app.TxInfo().OnAfterFunc(callback)`.
+func (app *BaseApp) TxInfo() *TxAppInfo {
+	return app.txInfo
+}
+
 // IsTransactional checks if the current app instance is part of a transaction.
 func (app *BaseApp) IsTransactional() bool {
-	return app.txInfo != nil
+	return app.TxInfo() != nil
 }
 
 // IsBootstrapped checks if the application was initialized
@@ -466,44 +497,100 @@ func (app *BaseApp) ResetBootstrapState() error {
 	return nil
 }
 
-// DB returns the default app data db instance (pb_data/data.db).
+// DB returns the default app data.db builder instance.
+//
+// To minimize SQLITE_BUSY errors, it automatically routes the
+// SELECT queries to the underlying concurrent db pool and everything
+// else to the nonconcurrent one.
+//
+// For more finer control over the used connections pools you can
+// call directly ConcurrentDB() or NonconcurrentDB().
 func (app *BaseApp) DB() dbx.Builder {
+	// transactional or both are nil
+	if app.concurrentDB == app.nonconcurrentDB {
+		return app.concurrentDB
+	}
+
+	return &dualDBBuilder{
+		concurrentDB:    app.concurrentDB,
+		nonconcurrentDB: app.nonconcurrentDB,
+	}
+}
+
+// ConcurrentDB returns the concurrent app data.db builder instance.
+//
+// This method is used mainly internally for executing db read
+// operations in a concurrent/non-blocking manner.
+//
+// Most users should use simply DB() as it will automatically
+// route the query execution to ConcurrentDB() or NonconcurrentDB().
+//
+// In a transaction the ConcurrentDB() and NonconcurrentDB() refer to the same *dbx.TX instance.
+func (app *BaseApp) ConcurrentDB() dbx.Builder {
 	return app.concurrentDB
 }
 
-// NonconcurrentDB returns the nonconcurrent app data db instance (pb_data/data.db).
+// NonconcurrentDB returns the nonconcurrent app data.db builder instance.
 //
 // The returned db instance is limited only to a single open connection,
-// meaning that it can process only 1 db operation at a time (other operations will be queued up).
+// meaning that it can process only 1 db operation at a time (other queries queue up).
 //
 // This method is used mainly internally and in the tests to execute write
 // (save/delete) db operations as it helps with minimizing the SQLITE_BUSY errors.
 //
-// For the majority of cases you would want to use the regular DB() method
-// since it allows concurrent db read operations.
+// Most users should use simply DB() as it will automatically
+// route the query execution to ConcurrentDB() or NonconcurrentDB().
 //
 // In a transaction the ConcurrentDB() and NonconcurrentDB() refer to the same *dbx.TX instance.
 func (app *BaseApp) NonconcurrentDB() dbx.Builder {
 	return app.nonconcurrentDB
 }
 
-// AuxDB returns the default app auxiliary db instance (pb_data/auxiliary.db).
+// AuxDB returns the app auxiliary.db builder instance.
+//
+// To minimize SQLITE_BUSY errors, it automatically routes the
+// SELECT queries to the underlying concurrent db pool and everything
+// else to the nonconcurrent one.
+//
+// For more finer control over the used connections pools you can
+// call directly AuxConcurrentDB() or AuxNonconcurrentDB().
 func (app *BaseApp) AuxDB() dbx.Builder {
+	// transactional or both are nil
+	if app.auxConcurrentDB == app.auxNonconcurrentDB {
+		return app.auxConcurrentDB
+	}
+
+	return &dualDBBuilder{
+		concurrentDB:    app.auxConcurrentDB,
+		nonconcurrentDB: app.auxNonconcurrentDB,
+	}
+}
+
+// AuxConcurrentDB returns the concurrent app auxiliary.db builder instance.
+//
+// This method is used mainly internally for executing db read
+// operations in a concurrent/non-blocking manner.
+//
+// Most users should use simply AuxDB() as it will automatically
+// route the query execution to AuxConcurrentDB() or AuxNonconcurrentDB().
+//
+// In a transaction the AuxConcurrentDB() and AuxNonconcurrentDB() refer to the same *dbx.TX instance.
+func (app *BaseApp) AuxConcurrentDB() dbx.Builder {
 	return app.auxConcurrentDB
 }
 
-// AuxNonconcurrentDB returns the nonconcurrent app auxiliary db instance (pb_data/auxiliary.db).
+// AuxNonconcurrentDB returns the nonconcurrent app auxiliary.db builder instance.
 //
 // The returned db instance is limited only to a single open connection,
-// meaning that it can process only 1 db operation at a time (other operations will be queued up).
+// meaning that it can process only 1 db operation at a time (other queries queue up).
 //
 // This method is used mainly internally and in the tests to execute write
 // (save/delete) db operations as it helps with minimizing the SQLITE_BUSY errors.
 //
-// For the majority of cases you would want to use the regular DB() method
-// since it allows concurrent db read operations.
+// Most users should use simply AuxDB() as it will automatically
+// route the query execution to AuxConcurrentDB() or AuxNonconcurrentDB().
 //
-// In a transaction the AuxNonconcurrentDB() and AuxNonconcurrentDB() refer to the same *dbx.TX instance.
+// In a transaction the AuxConcurrentDB() and AuxNonconcurrentDB() refer to the same *dbx.TX instance.
 func (app *BaseApp) AuxNonconcurrentDB() dbx.Builder {
 	return app.auxNonconcurrentDB
 }
@@ -643,9 +730,10 @@ func (app *BaseApp) NewMailClient() mailer.Mailer {
 //
 // NB! Make sure to call Close() on the returned result
 // after you are done working with it.
-func (app *BaseApp) NewFilesystem() (*filesystem.System, error) {
+func (app *BaseApp) NewFilesystem() (fsys *filesystem.System, err error) {
 	if app.settings != nil && app.settings.S3.Enabled {
-		return filesystem.NewS3(
+		// S3
+		fsys, err = filesystem.NewS3(
 			app.settings.S3.Bucket,
 			app.settings.S3.Region,
 			app.settings.S3.Endpoint,
@@ -653,13 +741,44 @@ func (app *BaseApp) NewFilesystem() (*filesystem.System, error) {
 			app.settings.S3.Secret,
 			app.settings.S3.ForcePathStyle,
 		)
+	} else {
+		// local filesystem
+		fsys, err = filesystem.NewLocal(filepath.Join(app.DataDir(), LocalStorageDirName))
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	// fallback to local filesystem
-	return filesystem.NewLocal(filepath.Join(app.DataDir(), LocalStorageDirName))
+	// attach delete hook
+	if app._onFilesystemDelete.Length() > 0 {
+		fsys.OnDelete().BindFunc(func(originalEvent *filesystem.DeleteEvent) error {
+			appEvent := new(FilesystemDeleteEvent)
+			appEvent.DeleteEvent = originalEvent
+			appEvent.App = app
+
+			return app._onFilesystemDelete.Trigger(appEvent, func(fde *FilesystemDeleteEvent) error {
+				return originalEvent.Next()
+			})
+		})
+	}
+
+	// attach write hook
+	if app._onFilesystemNewWriter.Length() > 0 {
+		fsys.OnNewWriter().BindFunc(func(originalEvent *filesystem.NewWriterEvent) error {
+			appEvent := new(FilesystemNewWriterEvent)
+			appEvent.NewWriterEvent = originalEvent
+			appEvent.App = app
+
+			return app._onFilesystemNewWriter.Trigger(appEvent, func(fwe *FilesystemNewWriterEvent) error {
+				return originalEvent.Next()
+			})
+		})
+	}
+
+	return fsys, nil
 }
 
-// NewFilesystem creates a new local or S3 filesystem instance
+// NewBackupsFilesystem creates a new local or S3 filesystem instance
 // for managing app backups based on the current app settings.
 //
 // NB! Make sure to call Close() on the returned result
@@ -707,7 +826,7 @@ func (app *BaseApp) Restart() error {
 			}
 		}()
 
-		return syscall.Exec(execPath, os.Args, os.Environ())
+		return execve(execPath, os.Args, os.Environ())
 	})
 }
 
@@ -948,6 +1067,18 @@ func (app *BaseApp) OnMailerRecordAuthAlertSend(tags ...string) *hook.TaggedHook
 }
 
 // -------------------------------------------------------------------
+// Filesystem event hooks
+// -------------------------------------------------------------------
+
+func (app *BaseApp) onFilesystemNewWriter() *hook.Hook[*FilesystemNewWriterEvent] {
+	return app._onFilesystemNewWriter
+}
+
+func (app *BaseApp) onFilesystemDelete() *hook.Hook[*FilesystemDeleteEvent] {
+	return app._onFilesystemDelete
+}
+
+// -------------------------------------------------------------------
 // Realtime API event hooks
 // -------------------------------------------------------------------
 
@@ -1104,7 +1235,7 @@ func (app *BaseApp) OnBatchRequest() *hook.Hook[*BatchRequestEvent] {
 // -------------------------------------------------------------------
 
 func (app *BaseApp) initDataDB() error {
-	dbPath := filepath.Join(app.DataDir(), "data.db")
+	dbPath := filepath.Join(app.DataDir(), dataDBFilename)
 
 	concurrentDB, err := app.config.DBConnect(dbPath)
 	if err != nil {
@@ -1145,14 +1276,14 @@ var sqlLogReplacements = []struct {
 }{
 	{regexp.MustCompile(`\[\[([^\[\]\{\}\.]+)\.([^\[\]\{\}\.]+)\]\]`), "`$1`.`$2`"},
 	{regexp.MustCompile(`\{\{([^\[\]\{\}\.]+)\.([^\[\]\{\}\.]+)\}\}`), "`$1`.`$2`"},
-	{regexp.MustCompile(`([^'"])\{\{`), "$1`"},
-	{regexp.MustCompile(`\}\}([^'"])`), "`$1"},
-	{regexp.MustCompile(`([^'"])\[\[`), "$1`"},
-	{regexp.MustCompile(`\]\]([^'"])`), "`$1"},
+	{regexp.MustCompile(`([^'"])?\{\{`), "$1`"},
+	{regexp.MustCompile(`\}\}([^'"])?`), "`$1"},
+	{regexp.MustCompile(`([^'"])?\[\[`), "$1`"},
+	{regexp.MustCompile(`\]\]([^'"])?`), "`$1"},
 	{regexp.MustCompile(`<nil>`), "NULL"},
 }
 
-// normalizeSQLLog replaces common query builder charactes with their plain SQL version for easier debugging.
+// normalizeSQLLog replaces common query builder characters with their plain SQL version for easier debugging.
 // The query is still not suitable for execution and should be used only for log and debug purposes
 // (the normalization is done here to avoid breaking changes in dbx).
 func normalizeSQLLog(sql string) string {
@@ -1166,7 +1297,7 @@ func normalizeSQLLog(sql string) string {
 func (app *BaseApp) initAuxDB() error {
 	// note: renamed to "auxiliary" because "aux" is a reserved Windows filename
 	// (see https://github.com/pocketbase/pocketbase/issues/5607)
-	dbPath := filepath.Join(app.DataDir(), "auxiliary.db")
+	dbPath := filepath.Join(app.DataDir(), auxDBFilename)
 
 	concurrentDB, err := app.config.DBConnect(dbPath)
 	if err != nil {
@@ -1190,6 +1321,33 @@ func (app *BaseApp) initAuxDB() error {
 	return nil
 }
 
+// @todo remove after refactoring the FilesManager interface
+func supportFiles(m Model) bool {
+	var collection *Collection
+	switch v := m.(type) {
+	case *Collection:
+		collection = v
+	case *Record:
+		collection = v.Collection()
+	case RecordProxy:
+		if v.ProxyRecord() != nil {
+			collection = v.ProxyRecord().Collection()
+		}
+	}
+
+	if collection == nil {
+		return true
+	}
+
+	for _, f := range collection.Fields {
+		if f.Type() == FieldTypeFile {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (app *BaseApp) registerBaseHooks() {
 	deletePrefix := func(prefix string) error {
 		fs, err := app.NewFilesystem()
@@ -1206,26 +1364,44 @@ func (app *BaseApp) registerBaseHooks() {
 		return nil
 	}
 
+	maxFilesDeleteWorkers := cast.ToInt64(os.Getenv("PB_FILES_DELETE_MAX_WORKERS"))
+	if maxFilesDeleteWorkers <= 0 {
+		maxFilesDeleteWorkers = 2000 // the value is arbitrary chosen and may change in the future
+	}
+
+	deleteSem := semaphore.NewWeighted(maxFilesDeleteWorkers)
+
 	// try to delete the storage files from deleted Collection, Records, etc. model
 	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
 		Id: "__pbFilesManagerDelete__",
 		Func: func(e *ModelEvent) error {
-			if m, ok := e.Model.(FilesManager); ok && m.BaseFilesPath() != "" {
+			if m, ok := e.Model.(FilesManager); ok && m.BaseFilesPath() != "" && supportFiles(e.Model) {
 				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
 				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
 				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
 
-				// run in the background for "optimistic" delete to avoid
-				// blocking the delete transaction
-				routine.FireAndForget(func() {
-					if err := deletePrefix(prefix); err != nil {
-						app.Logger().Error(
-							"Failed to delete storage prefix (non critical error; usually could happen because of S3 api limits)",
-							slog.String("prefix", prefix),
-							slog.String("error", err.Error()),
-						)
-					}
-				})
+				// note: for now assume no context cancellation
+				err := deleteSem.Acquire(context.Background(), 1)
+				if err != nil {
+					app.Logger().Error(
+						"Failed to delete storage prefix (couldn't acquire a worker)",
+						slog.String("prefix", prefix),
+						slog.String("error", err.Error()),
+					)
+				} else {
+					// run in the background for "optimistic" delete to avoid blocking the delete transaction
+					routine.FireAndForget(func() {
+						defer deleteSem.Release(1)
+
+						if err := deletePrefix(prefix); err != nil {
+							app.Logger().Error(
+								"Failed to delete storage prefix (non critical error; usually could happen because of S3 api limits)",
+								slog.String("prefix", prefix),
+								slog.String("error", err.Error()),
+							)
+						}
+					})
+				}
 			}
 
 			return e.Next()
@@ -1254,7 +1430,7 @@ func (app *BaseApp) registerBaseHooks() {
 			app.Logger().Warn("Failed to run periodic PRAGMA wal_checkpoint for the auxiliary DB", slog.String("error", execErr.Error()))
 		}
 
-		_, execErr = app.DB().NewQuery("PRAGMA optimize").Execute()
+		_, execErr = app.NonconcurrentDB().NewQuery("PRAGMA optimize").Execute()
 		if execErr != nil {
 			app.Logger().Warn("Failed to run periodic PRAGMA optimize", slog.String("error", execErr.Error()))
 		}
@@ -1269,6 +1445,7 @@ func (app *BaseApp) registerBaseHooks() {
 	app.registerMFAHooks()
 	app.registerOTPHooks()
 	app.registerAuthOriginHooks()
+	app.registerNotifyWatcherHooks()
 }
 
 // getLoggerMinLevel returns the logger min level based on the
@@ -1295,7 +1472,7 @@ func getLoggerMinLevel(app App) slog.Level {
 func (app *BaseApp) initLogger() error {
 	duration := 3 * time.Second
 	ticker := time.NewTicker(duration)
-	done := make(chan bool)
+	done := make(chan bool, 1)
 
 	handler := logger.NewBatchHandler(logger.BatchOptions{
 		Level:     getLoggerMinLevel(app),
@@ -1343,7 +1520,7 @@ func (app *BaseApp) initLogger() error {
 		},
 	})
 
-	go func() {
+	routine.FireAndForget(func() {
 		ctx := context.Background()
 
 		for {
@@ -1354,7 +1531,7 @@ func (app *BaseApp) initLogger() error {
 				handler.WriteAll(ctx)
 			}
 		}
-	}()
+	})
 
 	app.logger = slog.New(handler)
 
@@ -1366,7 +1543,11 @@ func (app *BaseApp) initLogger() error {
 
 			ticker.Stop()
 
-			done <- true
+			// don't block in case OnTerminate is triggered more than once
+			select {
+			case done <- true:
+			default:
+			}
 
 			return e.Next()
 		},

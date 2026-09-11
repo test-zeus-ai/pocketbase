@@ -3,7 +3,7 @@ package apis
 import (
 	"net/http"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/core/validators"
 	"github.com/pocketbase/pocketbase/tools/security"
@@ -54,7 +54,9 @@ func recordConfirmPasswordReset(e *core.RequestEvent) error {
 
 		e.App.Store().Remove(getPasswordResetResendKey(authRecord))
 
-		return e.NoContent(http.StatusNoContent)
+		return execAfterSuccessTx(true, e.App, func() error {
+			return e.NoContent(http.StatusNoContent)
+		})
 	})
 }
 

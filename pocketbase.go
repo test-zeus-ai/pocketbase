@@ -1,6 +1,7 @@
 package pocketbase
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/signal"
@@ -9,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/pocketbase/pocketbase/cmd"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/list"
+	"github.com/pocketbase/pocketbase/tools/osutils"
 	"github.com/pocketbase/pocketbase/tools/routine"
 	"github.com/spf13/cobra"
 
@@ -116,8 +117,9 @@ func NewWithConfig(config Config) *PocketBase {
 		hideStartBanner:   config.HideStartBanner,
 	}
 
-	// replace with a colored stderr writer
-	pb.RootCmd.SetErr(newErrWriter())
+	// don't write command errors to the stderr because the error is
+	// propagated back to the app.Start() and could result in duplication
+	pb.RootCmd.SetErr(&nopWrite{})
 
 	// parse base flags
 	// (errors are ignored, since the full flags parsing happens on Execute())
@@ -182,32 +184,33 @@ func (pb *PocketBase) Execute() error {
 		}
 	}
 
-	done := make(chan bool, 1)
+	execCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
 
 	// listen for interrupt signal to gracefully shutdown the application
-	go func() {
-		sigch := make(chan os.Signal, 1)
-		signal.Notify(sigch, os.Interrupt, syscall.SIGTERM)
-		<-sigch
-
-		done <- true
-	}()
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	// execute the root command
 	go func() {
-		// note: leave to the commands to decide whether to print their error
-		pb.RootCmd.Execute()
-
-		done <- true
+		execCh <- routine.SafeWrap(pb.RootCmd.Execute)()
 	}()
 
-	<-done
+	// wait for either an OS signal or the command to complete
+	var execErr error
+	select {
+	case <-sigCh:
+	case execErr = <-execCh:
+	}
+
+	signal.Stop(sigCh)
 
 	// trigger cleanups
+	//
+	// @todo consider skipping and just call the finalizer in case OnTerminate was already invoked manually?
 	event := new(core.TerminateEvent)
 	event.App = pb
 	return pb.OnTerminate().Trigger(event, func(e *core.TerminateEvent) error {
-		return e.App.ResetBootstrapState()
+		return errors.Join(e.App.ResetBootstrapState(), execErr)
 	})
 }
 
@@ -293,7 +296,7 @@ func (pb *PocketBase) skipBootstrap() bool {
 // note: we are using os.Args[0] and not os.Executable() since it could
 // break existing aliased binaries (eg. the community maintained homebrew package)
 func inspectRuntime() (baseDir string, withGoRun bool) {
-	if strings.HasPrefix(os.Args[0], os.TempDir()) {
+	if osutils.IsProbablyGoRun() {
 		// probably ran with go run
 		withGoRun = true
 		baseDir, _ = os.Getwd()
@@ -305,24 +308,10 @@ func inspectRuntime() (baseDir string, withGoRun bool) {
 	return
 }
 
-// newErrWriter returns a red colored stderr writter.
-func newErrWriter() *coloredWriter {
-	return &coloredWriter{
-		w: os.Stderr,
-		c: color.New(color.FgRed),
-	}
-}
+var _ io.Writer = (*nopWrite)(nil)
 
-// coloredWriter is a small wrapper struct to construct a [color.Color] writter.
-type coloredWriter struct {
-	w io.Writer
-	c *color.Color
-}
+type nopWrite struct{}
 
-// Write writes the p bytes using the colored writer.
-func (colored *coloredWriter) Write(p []byte) (n int, err error) {
-	colored.c.SetWriter(colored.w)
-	defer colored.c.UnsetWriter(colored.w)
-
-	return colored.c.Print(string(p))
+func (w *nopWrite) Write(p []byte) (n int, err error) {
+	return
 }

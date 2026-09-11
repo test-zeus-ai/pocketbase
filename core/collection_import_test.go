@@ -1,7 +1,7 @@
 package core_test
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"strings"
 	"testing"
 
@@ -170,7 +170,7 @@ func TestImportCollections(t *testing.T) {
 				expectedCollectionFields := map[string]int{
 					core.CollectionNameAuthOrigins: 6,
 					"nologin":                      10,
-					"demo1":                        18,
+					"demo1":                        19,
 					"demo2":                        5,
 					"demo3":                        5,
 					"demo4":                        16,
@@ -449,7 +449,7 @@ func TestImportCollectionsCreateRules(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, err := json.Marshal(collection)
+	raw, err := json.Marshal(collection, json.Deterministic(true))
 	if err != nil {
 		t.Fatal(err)
 	}

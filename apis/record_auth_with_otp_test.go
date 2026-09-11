@@ -327,6 +327,15 @@ func TestRecordAuthWithOTP(t *testing.T) {
 				if user.Verified() {
 					t.Fatal("Expected the user to remain unverified because sentTo != email")
 				}
+
+				// ensure that all pre-existing OAuth2 were NOT deleted
+				externalAuths, err := app.FindAllExternalAuthsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(externalAuths) != 2 {
+					t.Fatalf("Expected 2 external auths, found %d", len(externalAuths))
+				}
 			},
 		},
 		{
@@ -364,6 +373,15 @@ func TestRecordAuthWithOTP(t *testing.T) {
 				if err := app.Save(otp); err != nil {
 					t.Fatal(err)
 				}
+
+				// verify that there are at least one pre-existing OAuth2 link
+				externalAuths, err := app.FindAllExternalAuthsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(externalAuths) == 0 {
+					t.Fatal("Expected at least one external auth")
+				}
 			},
 			ExpectedStatus: 200,
 			ExpectedContent: []string{
@@ -388,10 +406,10 @@ func TestRecordAuthWithOTP(t *testing.T) {
 				"OnModelCreate":             1,
 				"OnModelCreateExecute":      1,
 				"OnModelAfterCreateSuccess": 1,
-				// OTP delete
-				"OnModelDelete":             1,
-				"OnModelDeleteExecute":      1,
-				"OnModelAfterDeleteSuccess": 1,
+				// record OTP + 2 ExternalAuths delete
+				"OnModelDelete":             3,
+				"OnModelDeleteExecute":      3,
+				"OnModelAfterDeleteSuccess": 3,
 				// user verified update
 				"OnModelUpdate":             1,
 				"OnModelUpdateExecute":      1,
@@ -401,9 +419,9 @@ func TestRecordAuthWithOTP(t *testing.T) {
 				"OnRecordCreate":             1,
 				"OnRecordCreateExecute":      1,
 				"OnRecordAfterCreateSuccess": 1,
-				"OnRecordDelete":             1,
-				"OnRecordDeleteExecute":      1,
-				"OnRecordAfterDeleteSuccess": 1,
+				"OnRecordDelete":             3,
+				"OnRecordDeleteExecute":      3,
+				"OnRecordAfterDeleteSuccess": 3,
 				"OnRecordUpdate":             1,
 				"OnRecordUpdateExecute":      1,
 				"OnRecordAfterUpdateSuccess": 1,
@@ -417,7 +435,72 @@ func TestRecordAuthWithOTP(t *testing.T) {
 				if !user.Verified() {
 					t.Fatal("Expected the user to be marked as verified")
 				}
+
+				// ensure that all pre-existing OTPs are cleared
+				otps, err := app.FindAllOTPsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(otps) > 0 {
+					t.Fatalf("Expected all OTPs to be cleared, found %d", len(otps))
+				}
+
+				// ensure that all pre-existing OAuth2 links are cleared
+				externalAuths, err := app.FindAllExternalAuthsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(externalAuths) > 0 {
+					t.Fatalf("Expected all external auths to be cleared, found %d", len(externalAuths))
+				}
 			},
+		},
+		{
+			Name:   "OnRecordAuthWithOTPRequest tx body write check",
+			Method: http.MethodPost,
+			URL:    "/api/collections/users/auth-with-otp",
+			Body: strings.NewReader(`{
+				"otpId":"` + strings.Repeat("a", 15) + `",
+				"password":"123456"
+			}`),
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				user, err := app.FindAuthRecordByEmail("users", "test@example.com")
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// disable MFA
+				user.Collection().MFA.Enabled = false
+				if err = app.Save(user.Collection()); err != nil {
+					t.Fatal(err)
+				}
+
+				otp := core.NewOTP(app)
+				otp.Id = strings.Repeat("a", 15)
+				otp.SetCollectionRef(user.Collection().Id)
+				otp.SetRecordRef(user.Id)
+				otp.SetPassword("123456")
+				if err := app.Save(otp); err != nil {
+					t.Fatal(err)
+				}
+
+				app.OnRecordAuthWithOTPRequest().BindFunc(func(e *core.RecordAuthWithOTPRequestEvent) error {
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
+				})
+			},
+			ExpectedStatus:  400,
+			ExpectedEvents:  map[string]int{"OnRecordAuthWithOTPRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 
 		// rate limit checks

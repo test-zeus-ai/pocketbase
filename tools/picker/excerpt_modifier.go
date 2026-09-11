@@ -53,7 +53,7 @@ func newExcerptModifier(args ...string) (*excerptModifier, error) {
 	}
 
 	max := cast.ToInt(args[0])
-	if max == 0 {
+	if max <= 0 {
 		return nil, errors.New("max argument must be > 0")
 	}
 
@@ -135,10 +135,14 @@ func (m *excerptModifier) Modify(value any) (any, error) {
 	result := strings.TrimSpace(builder.String())
 
 	if len(result) > m.max {
-		result = strings.TrimSpace(result[:m.max])
-
-		if m.withEllipsis {
-			result += "..."
+		// note: casted to []rune to properly account for multi-byte chars
+		runes := []rune(result)
+		if len(runes) > m.max {
+			result = string(runes[:m.max])
+			result = strings.TrimSpace(result)
+			if m.withEllipsis {
+				result += "..."
+			}
 		}
 	}
 

@@ -3,10 +3,12 @@ package apis_test
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/subscriptions"
@@ -15,9 +17,9 @@ import (
 func TestRecordAuthWithOAuth2Redirect(t *testing.T) {
 	t.Parallel()
 
-	clientStubs := make([]map[string]subscriptions.Client, 0, 10)
+	clientStubs := make([]map[string]subscriptions.Client, 0, 11)
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 11; i++ {
 		c1 := subscriptions.NewDefaultClient()
 
 		c2 := subscriptions.NewDefaultClient()
@@ -264,6 +266,96 @@ func TestRecordAuthWithOAuth2Redirect(t *testing.T) {
 				if clientStubs[7]["c3"].HasSubscription("@oauth2") {
 					t.Fatalf("Expected oauth2 subscription to be removed")
 				}
+			},
+		},
+		{
+			Name:   "(POST) Apple user's name json (nameKey error)",
+			Method: http.MethodPost,
+			URL:    "/api/oauth2-redirect",
+			Body: strings.NewReader(url.Values{
+				"code":  []string{strings.Repeat("a", 986)},
+				"state": []string{clientStubs[8]["c3"].Id()},
+				"user": []string{
+					`{"name":{"firstName":"aaa","lastName":"` + strings.Repeat("b", 200) + `"}}`,
+				},
+			}.Encode()),
+			Headers: map[string]string{
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			BeforeTestFunc: beforeTestFunc(clientStubs[8], map[string][]string{
+				"c3": {`"state":"` + clientStubs[8]["c3"].Id(), `"code":"` + strings.Repeat("a", 986) + `"`},
+			}),
+			ExpectedStatus: http.StatusSeeOther,
+			ExpectedEvents: map[string]int{"*": 0},
+			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+				app.Store().Get("cancelFunc").(context.CancelFunc)()
+
+				checkSuccessRedirect(t, app, res)
+
+				if clientStubs[8]["c3"].HasSubscription("@oauth2") {
+					t.Fatalf("Expected oauth2 subscription to be removed")
+				}
+
+				if storedName := app.Store().Get("@redirect_name_" + strings.Repeat("a", 986)); storedName != nil {
+					t.Fatalf("Didn't expect stored name, got %q", storedName)
+				}
+			},
+		},
+		{
+			Name:   "(POST) Apple user's name json",
+			Method: http.MethodPost,
+			URL:    "/api/oauth2-redirect",
+			Body: strings.NewReader(url.Values{
+				"code":  []string{strings.Repeat("a", 985)},
+				"state": []string{clientStubs[9]["c3"].Id()},
+				"user": []string{
+					`{"name":{"firstName":"aaa","lastName":"` + strings.Repeat("b", 200) + `"}}`,
+				},
+			}.Encode()),
+			Headers: map[string]string{
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			BeforeTestFunc: beforeTestFunc(clientStubs[9], map[string][]string{
+				"c3": {`"state":"` + clientStubs[9]["c3"].Id(), `"code":"` + strings.Repeat("a", 985) + `"`},
+			}),
+			ExpectedStatus: http.StatusSeeOther,
+			ExpectedEvents: map[string]int{"*": 0},
+			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+				app.Store().Get("cancelFunc").(context.CancelFunc)()
+
+				checkSuccessRedirect(t, app, res)
+
+				if clientStubs[9]["c3"].HasSubscription("@oauth2") {
+					t.Fatalf("Expected oauth2 subscription to be removed")
+				}
+
+				storedName, _ := app.Store().Get("@redirect_name_" + strings.Repeat("a", 985)).(string)
+				expectedName := "aaa " + strings.Repeat("b", 146)
+				if storedName != expectedName {
+					t.Fatalf("Expected stored name\n%q\ngot\n%q", expectedName, storedName)
+				}
+			},
+		},
+		{
+			Name:    "client with different IP",
+			Method:  http.MethodGet,
+			URL:     "/api/oauth2-redirect?code=123&state=" + clientStubs[10]["c3"].Id(),
+			Headers: map[string]string{"x-test-ip": "127.0.0.2"},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				app.Settings().TrustedProxy.Headers = []string{"x-test-ip"}
+
+				clientStubs[10]["c3"].Set(apis.RealtimeClientIPKey, "127.0.0.1")
+
+				beforeTestFunc(clientStubs[10], map[string][]string{
+					"c3": {`"state":"` + clientStubs[10]["c3"].Id(), `"code":"123"`},
+				})(t, app, e)
+			},
+			ExpectedStatus: http.StatusTemporaryRedirect,
+			ExpectedEvents: map[string]int{"*": 0},
+			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+				app.Store().Get("cancelFunc").(context.CancelFunc)()
+
+				checkFailureRedirect(t, app, res)
 			},
 		},
 	}

@@ -3,7 +3,7 @@ package apis
 import (
 	"net/http"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 )
@@ -45,7 +45,9 @@ func recordConfirmEmailChange(e *core.RequestEvent) error {
 			return firstApiError(err, e.BadRequestError("Failed to confirm email change.", err))
 		}
 
-		return e.NoContent(http.StatusNoContent)
+		return execAfterSuccessTx(true, e.App, func() error {
+			return e.NoContent(http.StatusNoContent)
+		})
 	})
 }
 
@@ -100,12 +102,6 @@ func (form *EmailChangeConfirmForm) parseToken() (*core.Record, string, error) {
 		return nil, "", validation.NewError("validation_invalid_token_payload", "Invalid token payload - newEmail must be set.")
 	}
 
-	// ensure that there aren't other users with the new email
-	_, err := form.app.FindAuthRecordByEmail(form.collection, newEmail)
-	if err == nil {
-		return nil, "", validation.NewError("validation_existing_token_email", "The new email address is already registered: "+newEmail)
-	}
-
 	// verify that the token is not expired and its signature is valid
 	authRecord, err := form.app.FindAuthRecordByToken(form.Token, core.TokenTypeEmailChange)
 	if err != nil {
@@ -114,6 +110,12 @@ func (form *EmailChangeConfirmForm) parseToken() (*core.Record, string, error) {
 
 	if authRecord.Collection().Id != form.collection.Id {
 		return nil, "", validation.NewError("validation_token_collection_mismatch", "The provided token is for different auth collection.")
+	}
+
+	// check if there are other users with the new email
+	_, err = form.app.FindAuthRecordByEmail(form.collection, newEmail)
+	if err == nil {
+		return nil, "", validation.NewError("validation_invalid_token_email", "The new email address is invalid.")
 	}
 
 	return authRecord, newEmail, nil

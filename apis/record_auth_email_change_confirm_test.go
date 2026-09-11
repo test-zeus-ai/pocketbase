@@ -1,7 +1,6 @@
 package apis_test
 
 import (
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -112,11 +111,50 @@ func TestRecordConfirmEmailChange(t *testing.T) {
 				"OnRecordUpdateExecute":             1,
 				"OnRecordAfterUpdateSuccess":        1,
 				"OnRecordValidate":                  1,
+				// unverified->verified external auths removal
+				"OnModelDelete":              2,
+				"OnModelDeleteExecute":       2,
+				"OnModelAfterDeleteSuccess":  2,
+				"OnRecordDelete":             2,
+				"OnRecordDeleteExecute":      2,
+				"OnRecordAfterDeleteSuccess": 2,
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				user, err := app.FindAuthRecordByEmail("users", "test@example.com")
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if user.Verified() {
+					t.Fatalf("Expected the user to be unverified before the confirmation")
+				}
+
+				// ensure that there is at least one pre-existing OAuth2 link
+				externalAuths, err := app.FindAllExternalAuthsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(externalAuths) == 0 {
+					t.Fatal("Expected at least one external auths")
+				}
 			},
 			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
-				_, err := app.FindAuthRecordByEmail("users", "change@example.com")
+				user, err := app.FindAuthRecordByEmail("users", "change@example.com")
 				if err != nil {
 					t.Fatalf("Expected to find user with email %q, got error: %v", "change@example.com", err)
+				}
+
+				if !user.Verified() {
+					t.Fatalf("Expected the user to be verified after the confirmation")
+				}
+
+				// ensure that all pre-existing OAuth2 links are cleared
+				externalAuths, err := app.FindAllExternalAuthsByRecord(user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(externalAuths) > 0 {
+					t.Fatalf("Expected all external auths to be cleared, found %d", len(externalAuths))
 				}
 			},
 		},
@@ -136,7 +174,7 @@ func TestRecordConfirmEmailChange(t *testing.T) {
 			ExpectedEvents: map[string]int{"*": 0},
 		},
 		{
-			Name:   "OnRecordAfterConfirmEmailChangeRequest error response",
+			Name:   "OnRecordConfirmEmailChangeRequest tx body write check",
 			Method: http.MethodPost,
 			URL:    "/api/collections/users/confirm-email-change",
 			Body: strings.NewReader(`{
@@ -145,15 +183,22 @@ func TestRecordConfirmEmailChange(t *testing.T) {
 			}`),
 			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
 				app.OnRecordConfirmEmailChangeRequest().BindFunc(func(e *core.RecordConfirmEmailChangeRequestEvent) error {
-					return errors.New("error")
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
 				})
 			},
 			ExpectedStatus:  400,
-			ExpectedContent: []string{`"data":{}`},
-			ExpectedEvents: map[string]int{
-				"*":                                 0,
-				"OnRecordConfirmEmailChangeRequest": 1,
-			},
+			ExpectedEvents:  map[string]int{"OnRecordConfirmEmailChangeRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 
 		// rate limit checks

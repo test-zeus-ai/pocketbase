@@ -3,9 +3,10 @@ package jsvm
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,9 +19,9 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pocketbase/dbx"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/forms"
@@ -78,10 +79,11 @@ func hooksBinds(app core.App, loader *goja.Runtime, executors *vmsPool) {
 				}
 
 				err := executors.run(func(executor *goja.Runtime) error {
-					executor.Set("$app", goja.Undefined())
+					oldApp := executor.Get("$app")
 					executor.Set("__args", handlerArgs)
 					res, err := executor.RunProgram(pr)
 					executor.Set("__args", goja.Undefined())
+					executor.Set("$app", oldApp) // reset to its default for the executor
 
 					// check for returned Go error value
 					if resErr := checkGojaValueForError(app, res); resErr != nil {
@@ -191,10 +193,12 @@ func wrapHandlerFunc(executors *vmsPool, handler goja.Value) (func(*core.Request
 
 		wrappedHandler := func(e *core.RequestEvent) error {
 			return executors.run(func(executor *goja.Runtime) error {
+				oldApp := executor.Get("$app")
 				executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
 				executor.Set("__args", []any{e})
 				res, err := executor.RunProgram(pr)
 				executor.Set("__args", goja.Undefined())
+				executor.Set("$app", oldApp)
 
 				// check for returned Go error value
 				if resErr := checkGojaValueForError(e.App, res); resErr != nil {
@@ -246,10 +250,12 @@ func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]*hook.
 				Priority: v.priority,
 				Func: func(e *core.RequestEvent) error {
 					return executors.run(func(executor *goja.Runtime) error {
+						oldApp := executor.Get("$app")
 						executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
 						executor.Set("__args", []any{e})
 						res, err := executor.RunProgram(pr)
 						executor.Set("__args", goja.Undefined())
+						executor.Set("$app", oldApp)
 
 						// check for returned Go error value
 						if resErr := checkGojaValueForError(e.App, res); resErr != nil {
@@ -266,10 +272,12 @@ func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]*hook.
 			wrappedMiddlewares[i] = &hook.Handler[*core.RequestEvent]{
 				Func: func(e *core.RequestEvent) error {
 					return executors.run(func(executor *goja.Runtime) error {
+						oldApp := executor.Get("$app")
 						executor.Set("$app", e.App) // overwrite the global $app with the hook scoped instance
 						executor.Set("__args", []any{e})
 						res, err := executor.RunProgram(pr)
 						executor.Set("__args", goja.Undefined())
+						executor.Set("$app", oldApp)
 
 						// check for returned Go error value
 						if resErr := checkGojaValueForError(e.App, res); resErr != nil {
@@ -288,9 +296,13 @@ func wrapMiddlewares(executors *vmsPool, rawMiddlewares ...goja.Value) ([]*hook.
 	return wrappedMiddlewares, nil
 }
 
+// -------------------------------------------------------------------
+
 var cachedArrayOfTypes = store.New[reflect.Type, reflect.Type](nil)
 
-func baseBinds(vm *goja.Runtime) {
+// BindCore registers common core objects and functions such as sleep,
+// toString, DynamicModel, etc. into the provided runtime.
+func BindCore(vm *goja.Runtime) {
 	vm.SetFieldNameMapper(FieldMapper{})
 
 	// deprecated: use toString
@@ -309,6 +321,44 @@ func baseBinds(vm *goja.Runtime) {
 		return string(bodyBytes), nil
 	})
 
+	// note: throw only on reader error
+	vm.Set("toBytes", func(raw any, maxReaderBytes int) ([]byte, error) {
+		switch v := raw.(type) {
+		case nil:
+			return []byte{}, nil
+		case string:
+			return []byte(v), nil
+		case []byte:
+			return v, nil
+		case types.JSONRaw:
+			return v, nil
+		case io.Reader:
+			if maxReaderBytes == 0 {
+				maxReaderBytes = router.DefaultMaxMemory
+			}
+
+			limitReader := io.LimitReader(v, int64(maxReaderBytes))
+
+			return io.ReadAll(limitReader)
+		default:
+			b, err := cast.ToUint8SliceE(v)
+			if err == nil {
+				return b, nil
+			}
+
+			str, err := cast.ToStringE(v)
+			if err == nil {
+				return []byte(str), nil
+			}
+
+			// as a last attempt try to json encode the value
+			rawBytes, _ := json.Marshal(raw, json.Deterministic(true))
+
+			return rawBytes, nil
+		}
+	})
+
+	// note: throw only on reader error
 	vm.Set("toString", func(raw any, maxReaderBytes int) (string, error) {
 		switch v := raw.(type) {
 		case io.Reader:
@@ -331,7 +381,7 @@ func baseBinds(vm *goja.Runtime) {
 			}
 
 			// as a last attempt try to json encode the value
-			rawBytes, _ := json.Marshal(raw)
+			rawBytes, _ := json.Marshal(raw, json.Deterministic(true))
 
 			return string(rawBytes), nil
 		}
@@ -391,6 +441,32 @@ func baseBinds(vm *goja.Runtime) {
 		instanceValue.SetPrototype(call.This.Prototype())
 
 		return instanceValue
+	})
+
+	// nullable helpers usually used as DynamicModel shape values
+	vm.Set("nullString", func() *string {
+		var v string
+		return &v
+	})
+	vm.Set("nullFloat", func() *float64 {
+		var v float64
+		return &v
+	})
+	vm.Set("nullInt", func() *int64 {
+		var v int64
+		return &v
+	})
+	vm.Set("nullBool", func() *bool {
+		var v bool
+		return &v
+	})
+	vm.Set("nullArray", func() *types.JSONArray[any] {
+		var v types.JSONArray[any]
+		return &v
+	})
+	vm.Set("nullObject", func() *types.JSONMap[any] {
+		var v types.JSONMap[any]
+		return &v
 	})
 
 	vm.Set("Record", func(call goja.ConstructorCall) *goja.Object {
@@ -495,6 +571,10 @@ func baseBinds(vm *goja.Runtime) {
 		instance := &core.FileField{}
 		return structConstructorUnmarshal(vm, call, instance)
 	})
+	vm.Set("GeoPointField", func(call goja.ConstructorCall) *goja.Object {
+		instance := &core.GeoPointField{}
+		return structConstructorUnmarshal(vm, call, instance)
+	})
 	// ---
 
 	vm.Set("MailerMessage", func(call goja.ConstructorCall) *goja.Object {
@@ -548,9 +628,18 @@ func baseBinds(vm *goja.Runtime) {
 	vm.Set("DateTime", func(call goja.ConstructorCall) *goja.Object {
 		instance := types.NowDateTime()
 
-		val, _ := call.Argument(0).Export().(string)
-		if val != "" {
-			instance, _ = types.ParseDateTime(val)
+		rawDate, _ := call.Argument(0).Export().(string)
+		locName, _ := call.Argument(1).Export().(string)
+		if rawDate != "" && locName != "" {
+			loc, err := time.LoadLocation(locName)
+			if err != nil {
+				loc = time.UTC
+			}
+
+			instance, _ = types.ParseDateTime(cast.ToTimeInDefaultLocation(rawDate, loc))
+		} else if rawDate != "" {
+			// forward directly to ParseDateTime to preserve the original behavior
+			instance, _ = types.ParseDateTime(rawDate)
 		}
 
 		instanceValue := vm.ToValue(instance).(*goja.Object)
@@ -581,7 +670,10 @@ func baseBinds(vm *goja.Runtime) {
 	})
 }
 
-func dbxBinds(vm *goja.Runtime) {
+// BindDbx registers $dbx.* namespaced object with dbx database builder related methods.
+//
+// See https://pocketbase.io/jsvm/modules/_dbx.html.
+func BindDbx(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$dbx", obj)
 
@@ -604,7 +696,10 @@ func dbxBinds(vm *goja.Runtime) {
 	obj.Set("notBetween", dbx.NotBetween)
 }
 
-func mailsBinds(vm *goja.Runtime) {
+// BindMails registers $mail.* namespaced object with common mail related helpers.
+//
+// See https://pocketbase.io/jsvm/modules/_mails.html.
+func BindMails(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$mails", obj)
 
@@ -612,9 +707,13 @@ func mailsBinds(vm *goja.Runtime) {
 	obj.Set("sendRecordVerification", mails.SendRecordVerification)
 	obj.Set("sendRecordChangeEmail", mails.SendRecordChangeEmail)
 	obj.Set("sendRecordOTP", mails.SendRecordOTP)
+	obj.Set("sendRecordAuthAlert", mails.SendRecordAuthAlert)
 }
 
-func securityBinds(vm *goja.Runtime) {
+// BindSecurity registers $security.* namespaced object with common security related helpers.
+//
+// See https://pocketbase.io/jsvm/modules/_security.html.
+func BindSecurity(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$security", obj)
 
@@ -657,10 +756,16 @@ func securityBinds(vm *goja.Runtime) {
 	})
 }
 
-func filesystemBinds(vm *goja.Runtime) {
+// BindFilesystem registers $filesystem.* namespaced object with
+// common filesystem package related helpers.
+//
+// See https://pocketbase.io/jsvm/modules/_filesystem.html.
+func BindFilesystem(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$filesystem", obj)
 
+	obj.Set("s3", filesystem.NewS3)
+	obj.Set("local", filesystem.NewLocal)
 	obj.Set("fileFromPath", filesystem.NewFileFromPath)
 	obj.Set("fileFromBytes", filesystem.NewFileFromBytes)
 	obj.Set("fileFromMultipart", filesystem.NewFileFromMultipart)
@@ -676,7 +781,11 @@ func filesystemBinds(vm *goja.Runtime) {
 	})
 }
 
-func filepathBinds(vm *goja.Runtime) {
+// BindFilepath registers $filepath.* namespaced object with
+// common std Go filepath package related exports.
+//
+// See https://pocketbase.io/jsvm/modules/_filepath.html.
+func BindFilepath(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$filepath", obj)
 
@@ -697,7 +806,11 @@ func filepathBinds(vm *goja.Runtime) {
 	obj.Set("walkDir", filepath.WalkDir)
 }
 
-func osBinds(vm *goja.Runtime) {
+// BindOS registers $os.* namespaced object with
+// common std Go os package related exports.
+//
+// See https://pocketbase.io/jsvm/modules/_os.html.
+func BindOS(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$os", obj)
 
@@ -719,21 +832,36 @@ func osBinds(vm *goja.Runtime) {
 	obj.Set("rename", os.Rename)
 	obj.Set("remove", os.Remove)
 	obj.Set("removeAll", os.RemoveAll)
+	obj.Set("openRoot", os.OpenRoot)
+	obj.Set("openInRoot", os.OpenInRoot)
 }
 
-func formsBinds(vm *goja.Runtime) {
+// BindForms registers various application form constructors.
+// These bindings are mostly used internally and/or preserved for backward compatibility with earlier versions.
+func BindForms(vm *goja.Runtime) {
 	registerFactoryAsConstructor(vm, "AppleClientSecretCreateForm", forms.NewAppleClientSecretCreate)
 	registerFactoryAsConstructor(vm, "RecordUpsertForm", forms.NewRecordUpsert)
 	registerFactoryAsConstructor(vm, "TestEmailSendForm", forms.NewTestEmailSend)
 	registerFactoryAsConstructor(vm, "TestS3FilesystemForm", forms.NewTestS3Filesystem)
 }
 
-func apisBinds(vm *goja.Runtime) {
+// BindApis registers $apis.* namespaced object with reusable Web API
+// handlers, middlewares and other related helpers.
+//
+// See https://pocketbase.io/jsvm/modules/_apis.html.
+func BindApis(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$apis", obj)
 
-	obj.Set("static", func(dir string, indexFallback bool) func(*core.RequestEvent) error {
-		return apis.Static(os.DirFS(dir), indexFallback)
+	obj.Set("static", func(dirOrFS any, indexFallback bool) func(*core.RequestEvent) error {
+		switch v := dirOrFS.(type) {
+		case fs.FS:
+			return apis.Static(v, indexFallback)
+		case string:
+			return apis.Static(os.DirFS(v), indexFallback)
+		default:
+			panic("$apis.static expects the first argument to be either a plain string path or fs.FS value")
+		}
 	})
 
 	// middlewares
@@ -760,7 +888,11 @@ func apisBinds(vm *goja.Runtime) {
 	registerFactoryAsConstructor(vm, "InternalServerError", router.NewInternalServerError)
 }
 
-func httpClientBinds(vm *goja.Runtime) {
+// BindHTTP registers $http.* namespaced object with common utils
+// for sending HTTP requests.
+//
+// See https://pocketbase.io/jsvm/modules/_http.html.
+func BindHTTP(vm *goja.Runtime) {
 	obj := vm.NewObject()
 	vm.Set("$http", obj)
 
@@ -774,11 +906,15 @@ func httpClientBinds(vm *goja.Runtime) {
 	})
 
 	type sendResult struct {
-		JSON       any                     `json:"json"`
-		Headers    map[string][]string     `json:"headers"`
-		Cookies    map[string]*http.Cookie `json:"cookies"`
-		Raw        string                  `json:"raw"`
-		StatusCode int                     `json:"statusCode"`
+		JSON    any                     `json:"json"`
+		Headers map[string][]string     `json:"headers"`
+		Cookies map[string]*http.Cookie `json:"cookies"`
+
+		// Deprecated: consider using Body instead
+		Raw string `json:"raw"`
+
+		Body       []byte `json:"body"`
+		StatusCode int    `json:"statusCode"`
 	}
 
 	type sendConfig struct {
@@ -883,6 +1019,7 @@ func httpClientBinds(vm *goja.Runtime) {
 			Headers:    map[string][]string{},
 			Cookies:    map[string]*http.Cookie{},
 			Raw:        string(bodyRaw),
+			Body:       bodyRaw,
 		}
 
 		for k, v := range res.Header {
@@ -893,7 +1030,7 @@ func httpClientBinds(vm *goja.Runtime) {
 			result.Cookies[v.Name] = v
 		}
 
-		if len(result.Raw) != 0 {
+		if len(result.Body) > 0 {
 			// try as map
 			result.JSON = map[string]any{}
 			if err := json.Unmarshal(bodyRaw, &result.JSON); err != nil {
@@ -1041,12 +1178,19 @@ var cachedDynamicModelStructs = store.New[string, reflect.Type](nil)
 // on the specified "shape".
 //
 // The "shape" values are used as defaults and could be of type:
-// - int (ex. 0)
-// - float (ex. -0)
-// - string (ex. "")
-// - bool (ex. false)
-// - slice (ex. [])
-// - map (ex. map[string]any{})
+//
+//   - int64      (ex.: 0)
+//   - *int64     (ex.: nullInt())
+//   - float64    (ex.: -0)
+//   - *float64   (ex.: nullFloat())
+//   - string     (ex.: "")
+//   - *string    (ex.: nullString())
+//   - bool       (ex.: false)
+//   - *bool      (ex.: nullBool())
+//   - slice/arr  (ex.: [])
+//   - *slice/arr (ex.: nullArray())
+//   - map        (ex.: {})
+//   - *map       (ex.: nullObject())
 //
 // Example:
 //
@@ -1073,15 +1217,18 @@ func newDynamicModel(shape map[string]any) any {
 		case reflect.Map:
 			raw, _ := json.Marshal(v)
 			newV := types.JSONMap[any]{}
-			newV.Scan(raw)
+			_ = newV.Scan(raw)
 			v = newV
 			vt = reflect.TypeOf(v)
 		case reflect.Slice, reflect.Array:
 			raw, _ := json.Marshal(v)
 			newV := types.JSONArray[any]{}
-			newV.Scan(raw)
+			_ = newV.Scan(raw)
 			v = newV
 			vt = reflect.TypeOf(newV)
+		case reflect.Pointer:
+			// for pointers always fallback to nil as their default value
+			v = nil
 		}
 
 		hash.WriteString(k)
@@ -1110,6 +1257,9 @@ func newDynamicModel(shape map[string]any) any {
 
 	// load default values into the new model
 	for i, item := range info {
+		if item.value == nil {
+			continue
+		}
 		elem.Field(i).Set(reflect.ValueOf(item.value))
 	}
 

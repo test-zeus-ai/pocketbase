@@ -1,9 +1,12 @@
 package core_test
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,6 +14,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/dbutils"
+	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/types"
 )
 
@@ -614,7 +618,7 @@ func TestCollectionUnmarshalJSON(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			rawResult, err := json.Marshal(collection)
+			rawResult, err := json.Marshal(collection, json.Deterministic(true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -756,6 +760,46 @@ func TestCollectionSerialize(t *testing.T) {
 	}
 }
 
+func TestCollectionSerializeNotModifyingCache(t *testing.T) {
+	t.Parallel()
+
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	c, err := app.FindCachedCollectionByNameOrId("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redactedFields := map[string]string{
+		"AuthToken.Secret":          c.AuthToken.Secret,
+		"FileToken.Secret":          c.FileToken.Secret,
+		"PasswordResetToken.Secret": c.PasswordResetToken.Secret,
+		"EmailChangeToken.Secret":   c.EmailChangeToken.Secret,
+		"VerificationToken.Secret":  c.VerificationToken.Secret,
+	}
+
+	if len(c.OAuth2.Providers) == 0 {
+		t.Fatal("Expected at least one users OAuth2 provider, got 0")
+	}
+	for _, p := range c.OAuth2.Providers {
+		redactedFields[p.Name+".ClientSecret"] = p.ClientSecret
+	}
+
+	for k, v := range redactedFields {
+		t.Run(k, func(t *testing.T) {
+			if v == "" {
+				t.Fatalf("Expected the redacted field %q to remain unmodified after serialization, got empty value", k)
+			}
+		})
+	}
+}
+
 func TestCollectionDBExport(t *testing.T) {
 	t.Parallel()
 
@@ -773,19 +817,19 @@ func TestCollectionDBExport(t *testing.T) {
 	}{
 		{
 			"unknown",
-			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":"{}","system":true,"type":"unknown","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
+			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"help":"","hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"help":"","hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":"{}","system":true,"type":"unknown","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
 		},
 		{
 			core.CollectionTypeBase,
-			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":"{}","system":true,"type":"base","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
+			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"help":"","hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"help":"","hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":"{}","system":true,"type":"base","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
 		},
 		{
 			core.CollectionTypeView,
-			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":{"viewQuery":"select 1"},"system":true,"type":"view","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
+			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"help":"","hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"help":"","hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":{"viewQuery":"select 1"},"system":true,"type":"view","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
 		},
 		{
 			core.CollectionTypeAuth,
-			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":{"authRule":null,"manageRule":"1=6","authAlert":{"enabled":false,"emailTemplate":{"subject":"","body":""}},"oauth2":{"providers":null,"mappedFields":{"id":"","name":"","username":"","avatarURL":""},"enabled":false},"passwordAuth":{"enabled":false,"identityFields":null},"mfa":{"enabled":false,"duration":0,"rule":""},"otp":{"enabled":false,"duration":0,"length":0,"emailTemplate":{"subject":"","body":""}},"authToken":{"duration":0},"passwordResetToken":{"duration":0},"emailChangeToken":{"duration":0},"verificationToken":{"duration":0},"fileToken":{"duration":0},"verificationTemplate":{"subject":"","body":""},"resetPasswordTemplate":{"subject":"","body":""},"confirmEmailChangeTemplate":{"subject":"","body":""}},"system":true,"type":"auth","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
+			`{"createRule":"1=3","created":"2024-07-01 01:02:03.456Z","deleteRule":"1=5","fields":[{"help":"","hidden":false,"id":"f1_id","name":"f1","presentable":false,"required":false,"system":true,"type":"bool"},{"help":"","hidden":false,"id":"f2_id","name":"f2","presentable":false,"required":true,"system":false,"type":"bool"}],"id":"test_id","indexes":["CREATE INDEX idx1 on test_name(id)","CREATE INDEX idx2 on test_name(id)"],"listRule":"1=1","name":"test_name","options":{"authRule":null,"manageRule":"1=6","authAlert":{"enabled":false,"emailTemplate":{"subject":"","body":""}},"oauth2":{"providers":[],"mappedFields":{"id":"","name":"","username":"","avatarURL":""},"enabled":false},"passwordAuth":{"enabled":false,"identityFields":[]},"mfa":{"enabled":false,"duration":0,"rule":""},"otp":{"enabled":false,"duration":0,"length":0,"emailTemplate":{"subject":"","body":""}},"authToken":{"duration":0},"passwordResetToken":{"duration":0},"emailChangeToken":{"duration":0},"verificationToken":{"duration":0},"fileToken":{"duration":0},"verificationTemplate":{"subject":"","body":""},"resetPasswordTemplate":{"subject":"","body":""},"confirmEmailChangeTemplate":{"subject":"","body":""}},"system":true,"type":"auth","updateRule":"1=4","updated":"2024-07-01 01:02:03.456Z","viewRule":"1=7"}`,
 		},
 	}
 
@@ -816,7 +860,7 @@ func TestCollectionDBExport(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			raw, err := json.Marshal(result)
+			raw, err := json.Marshal(result, json.Deterministic(true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -974,6 +1018,280 @@ func TestCollectionDelete(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCollectionModelEventSync(t *testing.T) {
+	t.Parallel()
+
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	testCollections := make([]*core.Collection, 4)
+	for i := 0; i < 4; i++ {
+		testCollections[i] = core.NewBaseCollection("sync_test_" + strconv.Itoa(i))
+		if err := app.Save(testCollections[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	createModelEvent := func() *core.ModelEvent {
+		event := new(core.ModelEvent)
+		event.App = app
+		event.Context = context.Background()
+		event.Type = "test_a"
+		event.Model = testCollections[0]
+		return event
+	}
+
+	createModelErrorEvent := func() *core.ModelErrorEvent {
+		event := new(core.ModelErrorEvent)
+		event.ModelEvent = *createModelEvent()
+		event.Error = errors.New("error_a")
+		return event
+	}
+
+	changeCollectionEventBefore := func(e *core.CollectionEvent) {
+		e.Type = "test_b"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 123)
+		e.Collection = testCollections[1]
+	}
+
+	modelEventFinalizerChange := func(e *core.ModelEvent) {
+		e.Type = "test_c"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 456)
+		e.Model = testCollections[2]
+	}
+
+	changeCollectionEventAfter := func(e *core.CollectionEvent) {
+		e.Type = "test_d"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 789)
+		e.Collection = testCollections[3]
+	}
+
+	expectedBeforeModelEventHandlerChecks := func(t *testing.T, e *core.ModelEvent) {
+		if e.Type != "test_a" {
+			t.Fatalf("Expected type %q, got %q", "test_a", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != nil {
+			t.Fatalf("Expected context value %v, got %v", nil, v)
+		}
+
+		if e.Model.PK() != testCollections[0].Id {
+			t.Fatalf("Expected collection with id %q, got %q (%d)", testCollections[0].Id, e.Model.PK(), 0)
+		}
+	}
+
+	expectedAfterModelEventHandlerChecks := func(t *testing.T, e *core.ModelEvent) {
+		if e.Type != "test_d" {
+			t.Fatalf("Expected type %q, got %q", "test_d", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != 789 {
+			t.Fatalf("Expected context value %v, got %v", 789, v)
+		}
+
+		if e.Model.PK() != testCollections[3].Id {
+			t.Fatalf("Expected collection with id %q, got %q (%d)", testCollections[3].Id, e.Model.PK(), 3)
+		}
+	}
+
+	expectedBeforeCollectionEventHandlerChecks := func(t *testing.T, e *core.CollectionEvent) {
+		if e.Type != "test_a" {
+			t.Fatalf("Expected type %q, got %q", "test_a", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != nil {
+			t.Fatalf("Expected context value %v, got %v", nil, v)
+		}
+
+		if e.Collection.Id != testCollections[0].Id {
+			t.Fatalf("Expected collection with id %q, got %q (%d)", testCollections[0].Id, e.Collection.Id, 0)
+		}
+	}
+
+	expectedAfterCollectionEventHandlerChecks := func(t *testing.T, e *core.CollectionEvent) {
+		if e.Type != "test_c" {
+			t.Fatalf("Expected type %q, got %q", "test_c", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != 456 {
+			t.Fatalf("Expected context value %v, got %v", 456, v)
+		}
+
+		if e.Collection.Id != testCollections[2].Id {
+			t.Fatalf("Expected collection with id %q, got %q (%d)", testCollections[2].Id, e.Collection.Id, 2)
+		}
+	}
+
+	modelEventFinalizer := func(e *core.ModelEvent) error {
+		modelEventFinalizerChange(e)
+		return nil
+	}
+
+	modelErrorEventFinalizer := func(e *core.ModelErrorEvent) error {
+		modelEventFinalizerChange(&e.ModelEvent)
+		e.Error = errors.New("error_c")
+		return nil
+	}
+
+	modelEventHandler := &hook.Handler[*core.ModelEvent]{
+		Priority: -999,
+		Func: func(e *core.ModelEvent) error {
+			t.Run("before model", func(t *testing.T) {
+				expectedBeforeModelEventHandlerChecks(t, e)
+			})
+
+			_ = e.Next()
+
+			t.Run("after model", func(t *testing.T) {
+				expectedAfterModelEventHandlerChecks(t, e)
+			})
+
+			return nil
+		},
+	}
+
+	modelErrorEventHandler := &hook.Handler[*core.ModelErrorEvent]{
+		Priority: -999,
+		Func: func(e *core.ModelErrorEvent) error {
+			t.Run("before model error", func(t *testing.T) {
+				expectedBeforeModelEventHandlerChecks(t, &e.ModelEvent)
+				if v := e.Error.Error(); v != "error_a" {
+					t.Fatalf("Expected error %q, got %q", "error_a", v)
+				}
+			})
+
+			_ = e.Next()
+
+			t.Run("after model error", func(t *testing.T) {
+				expectedAfterModelEventHandlerChecks(t, &e.ModelEvent)
+				if v := e.Error.Error(); v != "error_d" {
+					t.Fatalf("Expected error %q, got %q", "error_d", v)
+				}
+			})
+
+			return nil
+		},
+	}
+
+	recordEventHandler := &hook.Handler[*core.CollectionEvent]{
+		Priority: -999,
+		Func: func(e *core.CollectionEvent) error {
+			t.Run("before collection", func(t *testing.T) {
+				expectedBeforeCollectionEventHandlerChecks(t, e)
+			})
+
+			changeCollectionEventBefore(e)
+
+			_ = e.Next()
+
+			t.Run("after collection", func(t *testing.T) {
+				expectedAfterCollectionEventHandlerChecks(t, e)
+			})
+
+			changeCollectionEventAfter(e)
+
+			return nil
+		},
+	}
+
+	collectionErrorEventHandler := &hook.Handler[*core.CollectionErrorEvent]{
+		Priority: -999,
+		Func: func(e *core.CollectionErrorEvent) error {
+			t.Run("before collection error", func(t *testing.T) {
+				expectedBeforeCollectionEventHandlerChecks(t, &e.CollectionEvent)
+				if v := e.Error.Error(); v != "error_a" {
+					t.Fatalf("Expected error %q, got %q", "error_c", v)
+				}
+			})
+
+			changeCollectionEventBefore(&e.CollectionEvent)
+			e.Error = errors.New("error_b")
+
+			_ = e.Next()
+
+			t.Run("after collection error", func(t *testing.T) {
+				expectedAfterCollectionEventHandlerChecks(t, &e.CollectionEvent)
+				if v := e.Error.Error(); v != "error_c" {
+					t.Fatalf("Expected error %q, got %q", "error_c", v)
+				}
+			})
+
+			changeCollectionEventAfter(&e.CollectionEvent)
+			e.Error = errors.New("error_d")
+
+			return nil
+		},
+	}
+
+	// OnModelValidate
+	app.OnCollectionValidate().Bind(recordEventHandler)
+	app.OnModelValidate().Bind(modelEventHandler)
+	app.OnModelValidate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelCreate
+	app.OnCollectionCreate().Bind(recordEventHandler)
+	app.OnModelCreate().Bind(modelEventHandler)
+	app.OnModelCreate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelCreateExecute
+	app.OnCollectionCreateExecute().Bind(recordEventHandler)
+	app.OnModelCreateExecute().Bind(modelEventHandler)
+	app.OnModelCreateExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterCreateSuccess
+	app.OnCollectionAfterCreateSuccess().Bind(recordEventHandler)
+	app.OnModelAfterCreateSuccess().Bind(modelEventHandler)
+	app.OnModelAfterCreateSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterCreateError
+	app.OnCollectionAfterCreateError().Bind(collectionErrorEventHandler)
+	app.OnModelAfterCreateError().Bind(modelErrorEventHandler)
+	app.OnModelAfterCreateError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
+
+	// OnModelUpdate
+	app.OnCollectionUpdate().Bind(recordEventHandler)
+	app.OnModelUpdate().Bind(modelEventHandler)
+	app.OnModelUpdate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelUpdateExecute
+	app.OnCollectionUpdateExecute().Bind(recordEventHandler)
+	app.OnModelUpdateExecute().Bind(modelEventHandler)
+	app.OnModelUpdateExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterUpdateSuccess
+	app.OnCollectionAfterUpdateSuccess().Bind(recordEventHandler)
+	app.OnModelAfterUpdateSuccess().Bind(modelEventHandler)
+	app.OnModelAfterUpdateSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterUpdateError
+	app.OnCollectionAfterUpdateError().Bind(collectionErrorEventHandler)
+	app.OnModelAfterUpdateError().Bind(modelErrorEventHandler)
+	app.OnModelAfterUpdateError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
+
+	// OnModelDelete
+	app.OnCollectionDelete().Bind(recordEventHandler)
+	app.OnModelDelete().Bind(modelEventHandler)
+	app.OnModelDelete().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelDeleteExecute
+	app.OnCollectionDeleteExecute().Bind(recordEventHandler)
+	app.OnModelDeleteExecute().Bind(modelEventHandler)
+	app.OnModelDeleteExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterDeleteSuccess
+	app.OnCollectionAfterDeleteSuccess().Bind(recordEventHandler)
+	app.OnModelAfterDeleteSuccess().Bind(modelEventHandler)
+	app.OnModelAfterDeleteSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterDeleteError
+	app.OnCollectionAfterDeleteError().Bind(collectionErrorEventHandler)
+	app.OnModelAfterDeleteError().Bind(modelErrorEventHandler)
+	app.OnModelAfterDeleteError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
 }
 
 func TestCollectionSaveModel(t *testing.T) {
@@ -1258,60 +1576,62 @@ func TestCollectionSaveViewWrapping(t *testing.T) {
 
 	viewName := "test_wrapping"
 
+	// note: some of the queries use "limit 0" because the tested field value could be empty
+	// which will trigger the extra sample records validation that are not important for this test
 	scenarios := []struct {
 		name     string
 		query    string
 		expected string
 	}{
 		{
-			"no wrapping - text field",
-			"select text as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select text as id, bool from demo1)",
+			"no wrapping - id field",
+			"select id, bool from demo1",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select id, bool from demo1)",
 		},
 		{
-			"no wrapping - id field",
-			"select text as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select text as id, bool from demo1)",
+			"no wrapping - text field",
+			"select text as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select text as id, bool from demo1 limit 0)",
 		},
 		{
 			"no wrapping - relation field",
-			"select rel_one as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select rel_one as id, bool from demo1)",
+			"select rel_one as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select rel_one as id, bool from demo1 limit 0)",
 		},
 		{
 			"no wrapping - select field",
-			"select select_many as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select select_many as id, bool from demo1)",
+			"select select_many as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select select_many as id, bool from demo1 limit 0)",
 		},
 		{
 			"no wrapping - email field",
-			"select email as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select email as id, bool from demo1)",
+			"select email as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select email as id, bool from demo1 limit 0)",
 		},
 		{
 			"no wrapping - datetime field",
-			"select datetime as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select datetime as id, bool from demo1)",
+			"select datetime as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select datetime as id, bool from demo1 limit 0)",
 		},
 		{
 			"no wrapping - url field",
-			"select url as id, bool from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select url as id, bool from demo1)",
+			"select url as id, bool from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (select url as id, bool from demo1 limit 0)",
 		},
 		{
 			"wrapping - bool field",
-			"select bool as id, text as txt, url from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT CAST(`id` as TEXT) `id`,`txt`,`url` FROM (select bool as id, text as txt, url from demo1))",
+			"select bool as id, text as txt, url from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT CAST(`id` as TEXT) `id`,`txt`,`url` FROM (select bool as id, text as txt, url from demo1 limit 0))",
 		},
 		{
 			"wrapping - bool field (different order)",
-			"select text as txt, url, bool as id from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT `txt`,`url`,CAST(`id` as TEXT) `id` FROM (select text as txt, url, bool as id from demo1))",
+			"select text as txt, url, bool as id from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT `txt`,`url`,CAST(`id` as TEXT) `id` FROM (select text as txt, url, bool as id from demo1 limit 0))",
 		},
 		{
 			"wrapping - json field",
-			"select json as id, text, url from demo1",
-			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT CAST(`id` as TEXT) `id`,`text`,`url` FROM (select json as id, text, url from demo1))",
+			"select json as id, text, url from demo1 limit 0",
+			"CREATE VIEW `test_wrapping` AS SELECT * FROM (SELECT CAST(`id` as TEXT) `id`,`text`,`url` FROM (select json as id, text, url from demo1 limit 0))",
 		},
 		{
 			"wrapping - numeric id",
@@ -1345,7 +1665,7 @@ func TestCollectionSaveViewWrapping(t *testing.T) {
 
 			var sql string
 
-			rowErr := app.DB().NewQuery("SELECT sql FROM sqlite_master WHERE type='view' AND name={:name}").
+			rowErr := app.ConcurrentDB().NewQuery("SELECT sql FROM sqlite_master WHERE type='view' AND name={:name}").
 				Bind(dbx.Params{"name": viewName}).
 				Row(&sql)
 			if rowErr != nil {
@@ -1356,5 +1676,42 @@ func TestCollectionSaveViewWrapping(t *testing.T) {
 				t.Fatalf("Expected query \n%v, \ngot \n%v", s.expected, sql)
 			}
 		})
+	}
+}
+
+func TestCollectionSaveIndexesTableNameNormalization(t *testing.T) {
+	t.Parallel()
+
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	dummyCollection := core.NewBaseCollection("new_test")
+	dummyCollection.Fields.Add(&core.TextField{Name: "test"})
+	dummyCollection.Indexes = []string{
+		"create index `new_test_idx1` on `` (`test`) where 1=1",
+		"create index `new_test_idx2` on `test` (`test`) where 1=2",
+		"create index `new_test_idx3` on `someting_else` (`test`) where 1=3",
+	}
+
+	err := app.Save(dummyCollection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// refetch a clean state
+	dummyCollection, err = app.FindCollectionByNameOrId(dummyCollection.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dummyCollection.Indexes) != 3 {
+		t.Fatalf("Expected 3 indexes, got %v", dummyCollection.Indexes)
+	}
+
+	for _, raw := range dummyCollection.Indexes {
+		parsed := dbutils.ParseIndex(raw)
+		if parsed.TableName != dummyCollection.Name {
+			t.Fatalf("Expected all indexes to have tableName %q, found %q:\n%s", dummyCollection.Name, parsed.TableName, raw)
+		}
 	}
 }

@@ -3,8 +3,8 @@ package apis
 import (
 	"net/http"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
-	"github.com/go-ozzo/ozzo-validation/v4/is"
+	validation "github.com/pocketbase/ozzo-validation/v4"
+	"github.com/pocketbase/ozzo-validation/v4/is"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/mails"
 )
@@ -43,7 +43,9 @@ func recordRequestEmailChange(e *core.RequestEvent) error {
 			return firstApiError(err, e.BadRequestError("Failed to request email change.", err))
 		}
 
-		return e.NoContent(http.StatusNoContent)
+		return execAfterSuccessTx(true, e.App, func() error {
+			return e.NoContent(http.StatusNoContent)
+		})
 	})
 }
 

@@ -3,7 +3,7 @@ package apis
 import (
 	"net/http"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/forms"
 	"github.com/pocketbase/pocketbase/tools/router"
@@ -16,6 +16,8 @@ func bindSettingsApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup.PATCH("", settingsSet)
 	subGroup.POST("/test/s3", settingsTestS3)
 	subGroup.POST("/test/email", settingsTestEmail)
+
+	// @todo move to collections
 	subGroup.POST("/apple/generate-client-secret", settingsGenerateAppleClientSecret)
 }
 
@@ -30,7 +32,9 @@ func settingsList(e *core.RequestEvent) error {
 	event.Settings = clone
 
 	return e.App.OnSettingsListRequest().Trigger(event, func(e *core.SettingsListRequestEvent) error {
-		return e.JSON(http.StatusOK, e.Settings)
+		return execAfterSuccessTx(true, e.App, func() error {
+			return e.JSON(http.StatusOK, e.Settings)
+		})
 	})
 }
 
@@ -60,12 +64,14 @@ func settingsSet(e *core.RequestEvent) error {
 			return e.BadRequestError("An error occurred while saving the new settings.", err)
 		}
 
-		appSettings, err := e.App.Settings().Clone()
-		if err != nil {
-			return e.InternalServerError("Failed to clone app settings.", err)
-		}
+		return execAfterSuccessTx(true, e.App, func() error {
+			appSettings, err := e.App.Settings().Clone()
+			if err != nil {
+				return e.InternalServerError("Failed to clone app settings.", err)
+			}
 
-		return e.JSON(http.StatusOK, appSettings)
+			return e.JSON(http.StatusOK, appSettings)
+		})
 	})
 }
 

@@ -377,6 +377,7 @@ func (drv *driver) NewRangeReader(ctx context.Context, key string, offset, lengt
 		return nil, err
 	}
 
+	// @todo consider replacing with os.Root
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -384,6 +385,7 @@ func (drv *driver) NewRangeReader(ctx context.Context, key string, offset, lengt
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			f.Close()
 			return nil, err
 		}
 	}
@@ -653,7 +655,7 @@ func (w *writer) Close() error {
 
 	// Always delete the temp file. On success, it will have been renamed so
 	// the Remove will fail.
-	tempname := w.File.Name()
+	tempname := w.Name()
 	defer os.Remove(tempname)
 
 	// Check if the write was cancelled.

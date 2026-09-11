@@ -1,7 +1,7 @@
 package search
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strconv"
@@ -56,27 +56,39 @@ func (f FilterData) BuildExprWithLimit(
 	raw := string(f)
 
 	// replace the placeholder params in the raw string filter
-	for _, p := range placeholderReplacements {
-		for key, value := range p {
-			var replacement string
-			switch v := value.(type) {
-			case nil:
-				replacement = "null"
-			case bool, float64, float32, int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
-				replacement = cast.ToString(v)
-			default:
-				replacement = cast.ToString(v)
+	if len(placeholderReplacements) > 0 {
+		replacements := make([]string, 0, len(placeholderReplacements[0])*2)
 
-				// try to json serialize as fallback
-				if replacement == "" {
-					raw, _ := json.Marshal(v)
-					replacement = string(raw)
+		for _, p := range placeholderReplacements {
+			for key, value := range p {
+				var replacement string
+
+				switch v := value.(type) {
+				case nil:
+					replacement = "null"
+				case bool, float64, float32, int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
+					replacement = cast.ToString(v)
+				default:
+					casted, err := cast.ToStringE(v)
+
+					// try to json serialize as fallback
+					if err != nil {
+						fallback, err := json.Marshal(v, json.Deterministic(true))
+						if err != nil {
+							return nil, fmt.Errorf("failed to serialize param %q: %w", key, err)
+						}
+						casted = string(fallback)
+					}
+
+					replacement = strconv.Quote(casted)
 				}
 
-				replacement = strconv.Quote(replacement)
+				replacements = append(replacements, "{:"+key+"}", replacement)
 			}
-			raw = strings.ReplaceAll(raw, "{:"+key+"}", replacement)
 		}
+
+		replacer := strings.NewReplacer(replacements...)
+		raw = replacer.Replace(raw)
 	}
 
 	cacheKey := raw + "/" + strconv.Itoa(maxExpressions)
@@ -218,7 +230,7 @@ func buildResolversExpr(
 			expr = dbx.Enclose(dbx.And(expr, mm))
 		} else if left.MultiMatchSubQuery != nil {
 			mm := &manyVsOneExpr{
-				noCoalesce:   left.NoCoalesce,
+				nullFallback: left.NullFallback,
 				subQuery:     left.MultiMatchSubQuery,
 				op:           op,
 				otherOperand: right,
@@ -227,7 +239,7 @@ func buildResolversExpr(
 			expr = dbx.Enclose(dbx.And(expr, mm))
 		} else if right.MultiMatchSubQuery != nil {
 			mm := &manyVsOneExpr{
-				noCoalesce:   right.NoCoalesce,
+				nullFallback: right.NullFallback,
 				subQuery:     right.MultiMatchSubQuery,
 				op:           op,
 				otherOperand: left,
@@ -249,13 +261,22 @@ func buildResolversExpr(
 	return expr, nil
 }
 
+var normalizedIdentifiers = map[string]string{
+	// if `null` field is missing, treat `null` identifier as NULL token
+	"null": "NULL",
+	// if `true` field is missing, treat `true` identifier as TRUE token
+	"true": "1",
+	// if `false` field is missing, treat `false` identifier as FALSE token
+	"false": "0",
+}
+
 func resolveToken(token fexpr.Token, fieldResolver FieldResolver) (*ResolverResult, error) {
 	switch token.Type {
 	case fexpr.TokenIdentifier:
 		// check for macros
 		// ---
 		if macroFunc, ok := identifierMacros[token.Literal]; ok {
-			placeholder := "t" + security.PseudorandomString(5)
+			placeholder := "t" + security.PseudorandomString(8)
 
 			macroValue, err := macroFunc()
 			if err != nil {
@@ -271,40 +292,43 @@ func resolveToken(token fexpr.Token, fieldResolver FieldResolver) (*ResolverResu
 		// custom resolver
 		// ---
 		result, err := fieldResolver.Resolve(token.Literal)
-
 		if err != nil || result.Identifier == "" {
-			m := map[string]string{
-				// if `null` field is missing, treat `null` identifier as NULL token
-				"null": "NULL",
-				// if `true` field is missing, treat `true` identifier as TRUE token
-				"true": "1",
-				// if `false` field is missing, treat `false` identifier as FALSE token
-				"false": "0",
-			}
-			if v, ok := m[strings.ToLower(token.Literal)]; ok {
-				return &ResolverResult{Identifier: v}, nil
+			for k, v := range normalizedIdentifiers {
+				if strings.EqualFold(k, token.Literal) {
+					return &ResolverResult{Identifier: v}, nil
+				}
 			}
 			return nil, err
 		}
 
 		return result, err
 	case fexpr.TokenText:
-		placeholder := "t" + security.PseudorandomString(5)
+		placeholder := "t" + security.PseudorandomString(8)
 
 		return &ResolverResult{
 			Identifier: "{:" + placeholder + "}",
 			Params:     dbx.Params{placeholder: token.Literal},
 		}, nil
 	case fexpr.TokenNumber:
-		placeholder := "t" + security.PseudorandomString(5)
+		placeholder := "t" + security.PseudorandomString(8)
 
 		return &ResolverResult{
 			Identifier: "{:" + placeholder + "}",
 			Params:     dbx.Params{placeholder: cast.ToFloat64(token.Literal)},
 		}, nil
+	case fexpr.TokenFunction:
+		fn, ok := TokenFunctions[token.Literal]
+		if !ok {
+			return nil, fmt.Errorf("unknown function %q", token.Literal)
+		}
+
+		args, _ := token.Meta.([]fexpr.Token)
+		return fn(func(argToken fexpr.Token) (*ResolverResult, error) {
+			return resolveToken(argToken, fieldResolver)
+		}, args...)
 	}
 
-	return nil, errors.New("unresolvable token type")
+	return nil, fmt.Errorf("unsupported token type %q", token.Type)
 }
 
 // Resolves = and != expressions in an attempt to minimize the COALESCE
@@ -314,9 +338,6 @@ func resolveToken(token fexpr.Token, fieldResolver FieldResolver) (*ResolverResu
 // `COALESCE(a, "") = ""` since the direct match can be accomplished
 // with a seek while the COALESCE will induce a table scan.
 func resolveEqualExpr(equal bool, left, right *ResolverResult) dbx.Expression {
-	isLeftEmpty := isEmptyIdentifier(left) || (len(left.Params) == 1 && hasEmptyParamValue(left))
-	isRightEmpty := isEmptyIdentifier(right) || (len(right.Params) == 1 && hasEmptyParamValue(right))
-
 	equalOp := "="
 	nullEqualOp := "IS"
 	concatOp := "OR"
@@ -331,15 +352,22 @@ func resolveEqualExpr(equal bool, left, right *ResolverResult) dbx.Expression {
 		nullExpr = "IS NOT NULL"
 	}
 
-	// no coalesce (eg. compare to a json field)
+	// no coalesce fallback (eg. compare to a json field)
 	// a IS b
 	// a IS NOT b
-	if left.NoCoalesce || right.NoCoalesce {
+	if left.NullFallback == NullFallbackDisabled ||
+		right.NullFallback == NullFallbackDisabled {
 		return dbx.NewExp(
 			fmt.Sprintf("%s %s %s", left.Identifier, nullEqualOp, right.Identifier),
 			mergeParams(left.Params, right.Params),
 		)
 	}
+
+	isLeftEmpty := isEmptyIdentifier(left) ||
+		(left.NullFallback == NullFallbackAuto && len(left.Params) == 1 && hasEmptyParamValue(left))
+
+	isRightEmpty := isEmptyIdentifier(right) ||
+		(right.NullFallback == NullFallbackAuto && len(right.Params) == 1 && hasEmptyParamValue(right))
 
 	// both operands are empty
 	if isLeftEmpty && isRightEmpty {
@@ -409,6 +437,10 @@ func hasEmptyParamValue(result *ResolverResult) bool {
 }
 
 func isKnownNonEmptyIdentifier(result *ResolverResult) bool {
+	if result.NullFallback == NullFallbackEnforced {
+		return false
+	}
+
 	switch strings.ToLower(result.Identifier) {
 	case "1", "0", "false", `true`:
 		return true
@@ -614,18 +646,18 @@ func (e *manyVsManyExpr) Build(db *dbx.DB, params dbx.Params) string {
 		return "0=1"
 	}
 
-	lAlias := "__ml" + security.PseudorandomString(5)
-	rAlias := "__mr" + security.PseudorandomString(5)
+	lAlias := "__ml" + security.PseudorandomString(8)
+	rAlias := "__mr" + security.PseudorandomString(8)
 
 	whereExpr, buildErr := buildResolversExpr(
 		&ResolverResult{
-			NoCoalesce: e.left.NoCoalesce,
-			Identifier: "[[" + lAlias + ".multiMatchValue]]",
+			NullFallback: e.left.NullFallback,
+			Identifier:   "[[" + lAlias + ".multiMatchValue]]",
 		},
 		e.op,
 		&ResolverResult{
-			NoCoalesce: e.right.NoCoalesce,
-			Identifier: "[[" + rAlias + ".multiMatchValue]]",
+			NullFallback: e.right.NullFallback,
+			Identifier:   "[[" + rAlias + ".multiMatchValue]]",
 			// note: the AfterBuild needs to be handled only once and it
 			// doesn't matter whether it is applied on the left or right subquery operand
 			AfterBuild: dbx.Not, // inverse for the not-exist expression
@@ -660,7 +692,7 @@ type manyVsOneExpr struct {
 	subQuery     dbx.Expression
 	op           fexpr.SignOp
 	inverse      bool
-	noCoalesce   bool
+	nullFallback NullFallbackPreference
 }
 
 // Build converts the expression into a SQL fragment.
@@ -671,12 +703,12 @@ func (e *manyVsOneExpr) Build(db *dbx.DB, params dbx.Params) string {
 		return "0=1"
 	}
 
-	alias := "__sm" + security.PseudorandomString(5)
+	alias := "__sm" + security.PseudorandomString(8)
 
 	r1 := &ResolverResult{
-		NoCoalesce: e.noCoalesce,
-		Identifier: "[[" + alias + ".multiMatchValue]]",
-		AfterBuild: dbx.Not, // inverse for the not-exist expression
+		NullFallback: e.nullFallback,
+		Identifier:   "[[" + alias + ".multiMatchValue]]",
+		AfterBuild:   dbx.Not, // inverse for the not-exist expression
 	}
 
 	r2 := &ResolverResult{

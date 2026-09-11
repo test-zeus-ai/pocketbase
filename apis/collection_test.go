@@ -1,7 +1,6 @@
 package apis_test
 
 import (
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -130,6 +129,32 @@ func TestCollectionsList(t *testing.T) {
 				"OnCollectionsListRequest": 1,
 			},
 		},
+		{
+			Name:   "OnCollectionsListRequest tx body write check",
+			Method: http.MethodGet,
+			URL:    "/api/collections",
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				app.OnCollectionsListRequest().BindFunc(func(e *core.CollectionsListRequestEvent) error {
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
+				})
+			},
+			ExpectedStatus:  400,
+			ExpectedEvents:  map[string]int{"OnCollectionsListRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
+		},
 	}
 
 	for _, scenario := range scenarios {
@@ -204,6 +229,32 @@ func TestCollectionView(t *testing.T) {
 				"*":                       0,
 				"OnCollectionViewRequest": 1,
 			},
+		},
+		{
+			Name:   "OnCollectionViewRequest tx body write check",
+			Method: http.MethodGet,
+			URL:    "/api/collections/wsmn24bux7wo113",
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				app.OnCollectionViewRequest().BindFunc(func(e *core.CollectionRequestEvent) error {
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
+				})
+			},
+			ExpectedStatus:  400,
+			ExpectedEvents:  map[string]int{"OnCollectionViewRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 	}
 
@@ -361,7 +412,7 @@ func TestCollectionDelete(t *testing.T) {
 			},
 		},
 		{
-			Name:   "OnCollectionAfterDeleteSuccessRequest error response",
+			Name:   "OnCollectionDeleteRequest tx body write check",
 			Method: http.MethodDelete,
 			URL:    "/api/collections/view2",
 			Headers: map[string]string{
@@ -369,15 +420,22 @@ func TestCollectionDelete(t *testing.T) {
 			},
 			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
 				app.OnCollectionDeleteRequest().BindFunc(func(e *core.CollectionRequestEvent) error {
-					return errors.New("error")
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
 				})
 			},
 			ExpectedStatus:  400,
-			ExpectedContent: []string{`"data":{}`},
-			ExpectedEvents: map[string]int{
-				"*":                         0,
-				"OnCollectionDeleteRequest": 1,
-			},
+			ExpectedEvents:  map[string]int{"OnCollectionDeleteRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 	}
 
@@ -478,7 +536,7 @@ func TestCollectionCreate(t *testing.T) {
 				`"type":"base"`,
 				`"system":false`,
 				// ensures that id field was prepended
-				`"fields":[{"autogeneratePattern":"[a-z0-9]{15}","hidden":false,"id":"text3208210256","max":15,"min":15,"name":"id","pattern":"^[a-z0-9]+$","presentable":false,"primaryKey":true,"required":true,"system":true,"type":"text"},{"autogeneratePattern":"","hidden":false,"id":"12345789","max":0,"min":0,"name":"test","pattern":"","presentable":false,"primaryKey":false,"required":false,"system":false,"type":"text"}]`,
+				`"fields":[{"autogeneratePattern":"[a-z0-9]{15}","help":"","hidden":false,"id":"text3208210256","max":15,"min":15,"name":"id","pattern":"^[a-z0-9]+$","presentable":false,"primaryKey":true,"required":true,"system":true,"type":"text"},{"autogeneratePattern":"","help":"","hidden":false,"id":"12345789","max":0,"min":0,"name":"test","pattern":"","presentable":false,"primaryKey":false,"required":false,"system":false,"type":"text"}]`,
 			},
 			ExpectedEvents: map[string]int{
 				"*":                              0,
@@ -527,7 +585,7 @@ func TestCollectionCreate(t *testing.T) {
 				`"name":"verified"`,
 				`"duration":123`,
 				// should overwrite the user required option but keep the min value
-				`{"autogeneratePattern":"","hidden":true,"id":"text2504183744","max":0,"min":10,"name":"tokenKey","pattern":"","presentable":false,"primaryKey":false,"required":true,"system":true,"type":"text"}`,
+				`{"autogeneratePattern":"","help":"","hidden":true,"id":"text2504183744","max":0,"min":10,"name":"tokenKey","pattern":"","presentable":false,"primaryKey":false,"required":true,"system":true,"type":"text"}`,
 			},
 			NotExpectedContent: []string{
 				`"secret":"`,
@@ -656,7 +714,7 @@ func TestCollectionCreate(t *testing.T) {
 			},
 		},
 		{
-			Name:   "OnCollectionCreateRequest error response",
+			Name:   "OnCollectionCreateRequest tx body write check",
 			Method: http.MethodPost,
 			URL:    "/api/collections",
 			Body:   strings.NewReader(`{"name":"new","type":"base"}`),
@@ -665,15 +723,22 @@ func TestCollectionCreate(t *testing.T) {
 			},
 			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
 				app.OnCollectionCreateRequest().BindFunc(func(e *core.CollectionRequestEvent) error {
-					return errors.New("error")
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
 				})
 			},
 			ExpectedStatus:  400,
-			ExpectedContent: []string{`"data":{}`},
-			ExpectedEvents: map[string]int{
-				"*":                         0,
-				"OnCollectionCreateRequest": 1,
-			},
+			ExpectedEvents:  map[string]int{"OnCollectionCreateRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 
 		// view
@@ -686,7 +751,7 @@ func TestCollectionCreate(t *testing.T) {
 				"name":"new",
 				"type":"view",
 				"fields":[{"type":"text","id":"12345789","name":"ignored!@#$"}],
-				"viewQuery":"invalid"
+				"viewQuery":"select '123' as abc"
 			}`),
 			Headers: map[string]string{
 				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
@@ -715,7 +780,7 @@ func TestCollectionCreate(t *testing.T) {
 				"name":"new",
 				"type":"view",
 				"fields":[{"type":"text","id":"12345789","name":"ignored!@#$"}],
-				"viewQuery": "select 1 as id from ` + core.CollectionNameSuperusers + `"
+				"viewQuery": "select 1 as id from ` + core.CollectionNameSuperusers + ` limit 1"
 			}`),
 			Headers: map[string]string{
 				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
@@ -724,7 +789,7 @@ func TestCollectionCreate(t *testing.T) {
 			ExpectedContent: []string{
 				`"name":"new"`,
 				`"type":"view"`,
-				`"fields":[{"autogeneratePattern":"","hidden":false,"id":"text3208210256","max":0,"min":0,"name":"id","pattern":"^[a-z0-9]+$","presentable":false,"primaryKey":true,"required":true,"system":true,"type":"text"}]`,
+				`"fields":[{"autogeneratePattern":"","help":"","hidden":false,"id":"text3208210256","max":0,"min":0,"name":"id","pattern":"^[a-z0-9]+$","presentable":false,"primaryKey":true,"required":true,"system":true,"type":"text"}]`,
 			},
 			ExpectedEvents: map[string]int{
 				"*":                              0,
@@ -978,7 +1043,7 @@ func TestCollectionUpdate(t *testing.T) {
 			},
 		},
 		{
-			Name:   "OnCollectionAfterUpdateSuccessRequest error response",
+			Name:   "OnCollectionUpdateRequest tx body write check",
 			Method: http.MethodPatch,
 			URL:    "/api/collections/demo1",
 			Body:   strings.NewReader(`{}`),
@@ -987,15 +1052,22 @@ func TestCollectionUpdate(t *testing.T) {
 			},
 			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
 				app.OnCollectionUpdateRequest().BindFunc(func(e *core.CollectionRequestEvent) error {
-					return errors.New("error")
+					original := e.App
+					return e.App.RunInTransaction(func(txApp core.App) error {
+						e.App = txApp
+						defer func() { e.App = original }()
+
+						if err := e.Next(); err != nil {
+							return err
+						}
+
+						return e.BadRequestError("TX_ERROR", nil)
+					})
 				})
 			},
 			ExpectedStatus:  400,
-			ExpectedContent: []string{`"data":{}`},
-			ExpectedEvents: map[string]int{
-				"*":                         0,
-				"OnCollectionUpdateRequest": 1,
-			},
+			ExpectedEvents:  map[string]int{"OnCollectionUpdateRequest": 1},
+			ExpectedContent: []string{"TX_ERROR"},
 		},
 		{
 			Name:   "authorized as superuser + invalid data (eg. existing name)",
@@ -1153,6 +1225,71 @@ func TestCollectionUpdate(t *testing.T) {
 				"OnModelValidate":              1,
 			},
 		},
+		{
+			Name:   "add another OAuth2 provider to an auth collection",
+			Method: http.MethodPatch,
+			URL:    "/api/collections/users",
+			Body: strings.NewReader(`{
+				"oauth2": {
+					"providers": [
+						{"name": "apple", "clientId": "a", "clientSecret": "b"},
+						{
+							"pkce": null,
+							"name": "google",
+							"authURL": "",
+							"displayName": "existing",
+							"extra": {}
+						}
+					]
+				}
+			}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				// verify that the collection has google and gitlab as OAuth2 providers
+				users, err := app.FindCollectionByNameOrId("users")
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if v := len(users.OAuth2.Providers); v != 2 {
+					t.Fatalf("Expected 2 OAuth2 providers, got %d", v)
+				}
+
+				if v := users.OAuth2.Providers[0].Name; v != "gitlab" {
+					t.Fatalf("Expected provider 0 to be %s, got %s", "gitlab", v)
+				}
+
+				if v := users.OAuth2.Providers[1].Name; v != "google" {
+					t.Fatalf("Expected provider 1 to be %s, got %s", "google", v)
+				}
+			},
+			ExpectedStatus: 200,
+			ExpectedContent: []string{
+				`"name":"google"`,
+				`"name":"apple"`,
+				`"displayName":"existing"`,
+				`"clientId":"test"`,
+				`"clientId":"a"`,
+			},
+			NotExpectedContent: []string{
+				`"name":"gitlab"`,
+				`clientSecret`,
+			},
+			ExpectedEvents: map[string]int{
+				"*":                              0,
+				"OnCollectionUpdateRequest":      1,
+				"OnCollectionUpdate":             1,
+				"OnCollectionUpdateExecute":      1,
+				"OnCollectionAfterUpdateSuccess": 1,
+				"OnCollectionValidate":           1,
+				"OnModelUpdate":                  1,
+				"OnModelUpdateExecute":           1,
+				"OnModelAfterUpdateSuccess":      1,
+				"OnModelValidate":                1,
+			},
+		},
 
 		// view
 		// -----------------------------------------------------------
@@ -1190,7 +1327,7 @@ func TestCollectionUpdate(t *testing.T) {
 			Body: strings.NewReader(`{
 				"name":"view2_update",
 				"fields":[{"type":"text","id":"12345789","name":"ignored!@#$"}],
-				"viewQuery": "select 2 as id, created, updated, email from ` + core.CollectionNameSuperusers + `"
+				"viewQuery": "select 2 as id, created, updated, email from ` + core.CollectionNameSuperusers + ` limit 1"
 			}`),
 			Headers: map[string]string{
 				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
@@ -1505,6 +1642,190 @@ func TestCollectionTruncate(t *testing.T) {
 			ExpectedStatus:  400,
 			ExpectedContent: []string{`"data":{}`},
 			ExpectedEvents:  map[string]int{"*": 0},
+		},
+	}
+
+	for _, scenario := range scenarios {
+		scenario.Test(t)
+	}
+}
+
+func TestCollectionOAuth2Providers(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:            "unauthorized",
+			Method:          http.MethodGet,
+			URL:             "/api/collections/meta/oauth2-providers",
+			ExpectedStatus:  401,
+			ExpectedContent: []string{`"data":{}`},
+			ExpectedEvents:  map[string]int{"*": 0},
+		},
+		{
+			Name:   "authorized as regular user",
+			Method: http.MethodGet,
+			URL:    "/api/collections/meta/oauth2-providers",
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyNTI0NjA0NDYxLCJyZWZyZXNoYWJsZSI6dHJ1ZX0.ZT3F0Z3iM-xbGgSG3LEKiEzHrPHr8t8IuHLZGGNuxLo",
+			},
+			ExpectedStatus:  403,
+			ExpectedContent: []string{`"data":{}`},
+			ExpectedEvents:  map[string]int{"*": 0},
+		},
+		{
+			Name:   "authorized as superuser",
+			Method: http.MethodGet,
+			URL:    "/api/collections/meta/oauth2-providers",
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 200,
+			ExpectedContent: []string{
+				`{"name":"oidc3","displayName":"OIDC","logo":"<svg`,
+			},
+			NotExpectedContent: []string{
+				`"order":`,
+				`"pkce":`,
+				`"scopes":`,
+				`"authURL":`,
+				`"tokenURL":`,
+				`"userInfoURL":`,
+			},
+		},
+	}
+
+	for _, scenario := range scenarios {
+		scenario.Test(t)
+	}
+}
+
+func TestCollectionTestView(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:            "unauthorized",
+			Method:          http.MethodPost,
+			URL:             "/api/collections/meta/dry-run-view",
+			Body:            strings.NewReader(`{"query":"select 1 as id"}`),
+			ExpectedStatus:  401,
+			ExpectedContent: []string{`"data":{}`},
+			ExpectedEvents:  map[string]int{"*": 0},
+		},
+		{
+			Name:   "authorized as regular user",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"select 1 as id"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyNTI0NjA0NDYxLCJyZWZyZXNoYWJsZSI6dHJ1ZX0.ZT3F0Z3iM-xbGgSG3LEKiEzHrPHr8t8IuHLZGGNuxLo",
+			},
+			ExpectedStatus:  403,
+			ExpectedContent: []string{`"data":{}`},
+			ExpectedEvents:  map[string]int{"*": 0},
+		},
+		{
+			Name:   "authorized as superuser",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"select 1 as id"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 200,
+			ExpectedContent: []string{
+				`"fields":[{`,
+				`"name":"id"`,
+				`"type":"text"`,
+				`"sample":[{`,
+				`"id":"1"`,
+			},
+		},
+		{
+			Name:   "empty query",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":""}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"data":{"query":`,
+			},
+		},
+		{
+			Name:   "query length beyond validator limit",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"` + strings.Repeat("a", 5001) + `"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"data":{"query":`,
+			},
+		},
+		{
+			Name:   "query with length equal to the validator limit",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"select 1 as id` + strings.Repeat(" ", 4986) + `"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 200,
+			ExpectedContent: []string{
+				`"fields":[{`,
+				`"name":"id"`,
+				`"type":"text"`,
+				`"sample":[`,
+				`"id":"1"`,
+			},
+		},
+		{
+			Name:   "missing ids sample",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"(select 1 as id union select '' as id)"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"data":{}`,
+				`Raw error:`,
+			},
+		},
+		{
+			Name:   "duplicated ids sample",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"(select 1 as id union all select 1 as id)"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"data":{}`,
+				`Raw error:`,
+			},
+		},
+		{
+			Name:   "write query",
+			Method: http.MethodPost,
+			URL:    "/api/collections/meta/dry-run-view",
+			Body:   strings.NewReader(`{"query":"CREATE TABLE t1(x INT)"}`),
+			Headers: map[string]string{
+				"Authorization": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY",
+			},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"data":{}`,
+				`Raw error:`,
+			},
 		},
 	}
 

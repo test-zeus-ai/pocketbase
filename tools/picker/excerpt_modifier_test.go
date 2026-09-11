@@ -29,6 +29,16 @@ func TestNewExcerptModifier(t *testing.T) {
 			true,
 		},
 		{
+			"negative max argument",
+			[]string{"-1"},
+			true,
+		},
+		{
+			"zero max argument",
+			[]string{"0"},
+			true,
+		},
+		{
 			"numeric max argument",
 			[]string{"12"},
 			false,
@@ -133,6 +143,20 @@ func TestExcerptModifierModify(t *testing.T) {
 			[]string{fmt.Sprint(len(plainText) + 5), "t"},
 			html,
 			plainText,
+		},
+
+		// multibyte chars
+		{
+			"mutibyte chars <= max",
+			[]string{"4", "t"},
+			"аб\nв ",
+			"аб в",
+		},
+		{
+			"mutibyte chars > max",
+			[]string{"3", "t"},
+			"аб\nв ",
+			"аб...",
 		},
 	}
 

@@ -2,7 +2,7 @@ package forms_test
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"maps"
 	"os"
@@ -534,7 +534,7 @@ func TestRecordUpsertSubmitValidations(t *testing.T) {
 			expectedErrors: []string{"password", "passwordConfirm"},
 		},
 		{
-			name:   "new auth collection record with invalid record and invalid form data (without manager acess)",
+			name:   "new auth collection record with invalid record and invalid form data (without manager access)",
 			record: core.NewRecord(usersCol),
 			data: map[string]any{
 				"verified":        true,
@@ -552,7 +552,7 @@ func TestRecordUpsertSubmitValidations(t *testing.T) {
 			expectedErrors: []string{"verified", "passwordConfirm"},
 		},
 		{
-			name:   "new auth collection record with invalid record and valid form data (without manager acess)",
+			name:   "new auth collection record with invalid record and valid form data (without manager access)",
 			record: core.NewRecord(usersCol),
 			data: map[string]any{
 				"verified":        false,
@@ -570,7 +570,7 @@ func TestRecordUpsertSubmitValidations(t *testing.T) {
 			expectedErrors: []string{"password", "username"},
 		},
 		{
-			name:          "new auth collection record with invalid record and invalid form data (with manager acess)",
+			name:          "new auth collection record with invalid record and invalid form data (with manager access)",
 			record:        core.NewRecord(usersCol),
 			managerAccess: true,
 			data: map[string]any{
@@ -589,7 +589,7 @@ func TestRecordUpsertSubmitValidations(t *testing.T) {
 			expectedErrors: []string{"passwordConfirm"},
 		},
 		{
-			name:          "new auth collection record with invalid record and valid form data (with manager acess)",
+			name:          "new auth collection record with invalid record and valid form data (with manager access)",
 			record:        core.NewRecord(usersCol),
 			managerAccess: true,
 			data: map[string]any{
@@ -885,6 +885,119 @@ func TestRecordUpsertSubmitSuccess(t *testing.T) {
 	}
 
 	testFilesCount(t, testApp, record, 2) // the file + attrs
+}
+
+func TestRecordUpsertPasswordsSync(t *testing.T) {
+	testApp, _ := tests.NewTestApp()
+	defer testApp.Cleanup()
+
+	users, err := testApp.FindCollectionByNameOrId("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("new user without password", func(t *testing.T) {
+		record := core.NewRecord(users)
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		err := form.Submit()
+
+		tests.TestValidationErrors(t, err, []string{"password", "passwordConfirm"})
+	})
+
+	t.Run("new user with manual password", func(t *testing.T) {
+		record := core.NewRecord(users)
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		record.SetPassword("1234567890")
+
+		err := form.Submit()
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+	})
+
+	t.Run("new user with random password", func(t *testing.T) {
+		record := core.NewRecord(users)
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		record.SetRandomPassword()
+
+		err := form.Submit()
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+	})
+
+	t.Run("update user with no password change", func(t *testing.T) {
+		record, err := testApp.FindAuthRecordByEmail(users, "test@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		oldHash := record.GetString("password:hash")
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		err = form.Submit()
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+
+		newHash := record.GetString("password:hash")
+		if newHash == "" || newHash != oldHash {
+			t.Fatal("Expected no password change")
+		}
+	})
+
+	t.Run("update user with manual password change", func(t *testing.T) {
+		record, err := testApp.FindAuthRecordByEmail(users, "test@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		oldHash := record.GetString("password:hash")
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		record.SetPassword("1234567890")
+
+		err = form.Submit()
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+
+		newHash := record.GetString("password:hash")
+		if newHash == "" || newHash == oldHash {
+			t.Fatal("Expected password change")
+		}
+	})
+
+	t.Run("update user with random password change", func(t *testing.T) {
+		record, err := testApp.FindAuthRecordByEmail(users, "test@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		oldHash := record.GetString("password:hash")
+
+		form := forms.NewRecordUpsert(testApp, record)
+
+		record.SetRandomPassword()
+
+		err = form.Submit()
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+
+		newHash := record.GetString("password:hash")
+		if newHash == "" || newHash == oldHash {
+			t.Fatal("Expected password change")
+		}
+	})
 }
 
 // -------------------------------------------------------------------

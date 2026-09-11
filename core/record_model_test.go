@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/filesystem"
+	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/spf13/cast"
 )
@@ -28,7 +32,7 @@ func TestNewRecord(t *testing.T) {
 
 	m := core.NewRecord(collection)
 
-	rawData, err := json.Marshal(m.FieldsData()) // should be initialized with the defaults
+	rawData, err := json.Marshal(m.FieldsData(), json.Deterministic(true)) // should be initialized with the defaults
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +521,7 @@ func TestRecordMergeExpand(t *testing.T) {
 
 	result := m.Expand()
 
-	raw, err := json.Marshal(result)
+	raw, err := json.Marshal(result, json.Deterministic(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +567,7 @@ func TestRecordMergeExpandNilCheck(t *testing.T) {
 			m := core.NewRecord(collection)
 			m.MergeExpand(s.expand)
 
-			raw, err := json.Marshal(m)
+			raw, err := json.Marshal(m, json.Deterministic(true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -660,7 +664,7 @@ func TestRecordFieldsData(t *testing.T) {
 	m.Set("field2", 456)
 	m.Set("unknown", 789)
 
-	raw, err := json.Marshal(m.FieldsData())
+	raw, err := json.Marshal(m.FieldsData(), json.Deterministic(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +692,7 @@ func TestRecordCustomData(t *testing.T) {
 	m.Set("field2", 456)
 	m.Set("unknown", 789)
 
-	raw, err := json.Marshal(m.CustomData())
+	raw, err := json.Marshal(m.CustomData(), json.Deterministic(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,7 +880,7 @@ func TestRecordGetInt(t *testing.T) {
 		{123, 123},
 		{2.4, 2},
 		{"123", 123},
-		{"123.5", 0},
+		{"123.5", 123},
 		{false, 0},
 		{true, 1},
 	}
@@ -889,6 +893,43 @@ func TestRecordGetInt(t *testing.T) {
 			record.Set("test", s.value)
 
 			result := record.GetInt("test")
+			if result != s.expected {
+				t.Fatalf("Expected %v, got %v", s.expected, result)
+			}
+		})
+	}
+}
+
+func TestRecordGetInt64(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []struct {
+		value    any
+		expected int64
+	}{
+		{nil, 0},
+		{"", 0},
+		{[]string{"true"}, 0},
+		{map[string]int{"test": 1}, 0},
+		{time.Now(), 0},
+		{"test", 0},
+		{123, 123},
+		{2.4, 2},
+		{1<<63 - 1, 1<<63 - 1},
+		{"123", 123},
+		{"123.5", 123},
+		{false, 0},
+		{true, 1},
+	}
+
+	collection := core.NewBaseCollection("test")
+	record := core.NewRecord(collection)
+
+	for i, s := range scenarios {
+		t.Run(fmt.Sprintf("%d_%#v", i, s.value), func(t *testing.T) {
+			record.Set("test", s.value)
+
+			result := record.GetInt64("test")
 			if result != s.expected {
 				t.Fatalf("Expected %v, got %v", s.expected, result)
 			}
@@ -1013,6 +1054,43 @@ func TestRecordGetStringSlice(t *testing.T) {
 	}
 }
 
+func TestRecordGetGeoPoint(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []struct {
+		value    any
+		expected string
+	}{
+		{nil, `{"lon":0,"lat":0}`},
+		{"", `{"lon":0,"lat":0}`},
+		{0, `{"lon":0,"lat":0}`},
+		{false, `{"lon":0,"lat":0}`},
+		{"{}", `{"lon":0,"lat":0}`},
+		{"[]", `{"lon":0,"lat":0}`},
+		{[]int{1, 2}, `{"lon":0,"lat":0}`},
+		{map[string]any{"lon": 1, "lat": 2}, `{"lon":1,"lat":2}`},
+		{[]byte(`{"lon":1,"lat":2}`), `{"lon":1,"lat":2}`},
+		{`{"lon":1,"lat":2}`, `{"lon":1,"lat":2}`},
+		{types.GeoPoint{Lon: 1, Lat: 2}, `{"lon":1,"lat":2}`},
+		{&types.GeoPoint{Lon: 1, Lat: 2}, `{"lon":1,"lat":2}`},
+	}
+
+	collection := core.NewBaseCollection("test")
+	record := core.NewRecord(collection)
+
+	for i, s := range scenarios {
+		t.Run(fmt.Sprintf("%d_%#v", i, s.value), func(t *testing.T) {
+			record.Set("test", s.value)
+
+			pointStr := record.GetGeoPoint("test").String()
+
+			if pointStr != s.expected {
+				t.Fatalf("Expected %q, got %q", s.expected, pointStr)
+			}
+		})
+	}
+}
+
 func TestRecordGetUnsavedFiles(t *testing.T) {
 	t.Parallel()
 
@@ -1063,14 +1141,16 @@ func TestRecordGetUnsavedFiles(t *testing.T) {
 		t.Run(fmt.Sprintf("%d_%#v", i, s.key), func(t *testing.T) {
 			v := record.GetUnsavedFiles(s.key)
 
-			raw, err := json.Marshal(v)
+			raw, err := json.Marshal(v,
+				json.Deterministic(true),
+				json.FormatNilSliceAsNull(true),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
-			rawStr := string(raw)
 
-			if rawStr != s.expected {
-				t.Fatalf("Expected\n%s\ngot\n%s", s.expected, rawStr)
+			if str := string(raw); str != s.expected {
+				t.Fatalf("Expected\n%s\ngot\n%s", s.expected, str)
 			}
 		})
 	}
@@ -1124,7 +1204,7 @@ func TestRecordUnmarshalJSONField(t *testing.T) {
 				t.Fatalf("Expected hasErr %v, got %v", s.expectError, hasErr)
 			}
 
-			raw, _ := json.Marshal(s.destination)
+			raw, _ := json.Marshal(s.destination, json.Deterministic(true))
 			if v := string(raw); v != s.expectedJSON {
 				t.Fatalf("Expected %q, got %q", s.expectedJSON, v)
 			}
@@ -1231,7 +1311,7 @@ func TestRecordDBExport(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			raw, err := json.Marshal(result)
+			raw, err := json.Marshal(result, json.Deterministic(true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1333,14 +1413,15 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 	f3 := &core.SelectField{Name: "field3", MaxSelect: 2, Values: []string{"test1", "test2", "test3"}}
 	f4 := &core.TextField{Name: "field4", Hidden: true}
 	f5 := &core.TextField{Name: "field5", Hidden: true}
+	f6 := &core.JSONField{Name: "field6"}
 
 	colBase := core.NewBaseCollection("test_base")
 	colBase.Id = "_pbc_base_123"
-	colBase.Fields.Add(f1, f2, f3, f4, f5)
+	colBase.Fields.Add(f1, f2, f3, f4, f5, f6)
 
 	colAuth := core.NewAuthCollection("test_auth")
 	colAuth.Id = "_pbc_auth_123"
-	colAuth.Fields.Add(f1, f2, f3, f4, f5)
+	colAuth.Fields.Add(f1, f2, f3, f4, f5, f6)
 
 	scenarios := []struct {
 		name                  string
@@ -1359,7 +1440,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			false,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_base_123","collectionName":"test_base","expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id"}`,
+			`{"collectionId":"_pbc_base_123","collectionName":"test_base","expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id"}`,
 		},
 		{
 			"[base] with email visibility",
@@ -1368,7 +1449,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			false,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_base_123","collectionName":"test_base","expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id"}`,
+			`{"collectionId":"_pbc_base_123","collectionName":"test_base","expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id"}`,
 		},
 		{
 			"[base] with custom data",
@@ -1377,7 +1458,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_base_123","collectionName":"test_base","email":"test_email","emailVisibility":"test_invalid","expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id","password":"test_passwordHash","tokenKey":"test_tokenKey","unknown":"test_unknown","verified":true}`,
+			`{"collectionId":"_pbc_base_123","collectionName":"test_base","email":"test_email","emailVisibility":"test_invalid","expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id","password":"test_passwordHash","tokenKey":"test_tokenKey","unknown":"test_unknown","verified":true}`,
 		},
 		{
 			"[base] with explicit hide and unhide fields",
@@ -1386,7 +1467,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			[]string{"field3", "field1", "expand", "collectionId", "collectionName", "email", "tokenKey", "unknown"},
 			[]string{"field4", "@pbInternalAbc"},
-			`{"emailVisibility":"test_invalid","field2":"field_2.png","field4":"field_4","id":"test_id","password":"test_passwordHash","verified":true}`,
+			`{"emailVisibility":"test_invalid","field2":"field_2.png","field4":"field_4","field6":{"a":1,"a":2},"id":"test_id","password":"test_passwordHash","verified":true}`,
 		},
 		{
 			"[base] trying to unhide custom fields without explicit WithCustomData",
@@ -1395,7 +1476,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			nil,
 			[]string{"field5", "@pbInternalAbc", "email", "tokenKey", "unknown"},
-			`{"collectionId":"_pbc_base_123","collectionName":"test_base","email":"test_email","emailVisibility":"test_invalid","expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"field5":"field_5","id":"test_id","password":"test_passwordHash","tokenKey":"test_tokenKey","unknown":"test_unknown","verified":true}`,
+			`{"collectionId":"_pbc_base_123","collectionName":"test_base","email":"test_email","emailVisibility":"test_invalid","expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field5":"field_5","field6":{"a":1,"a":2},"id":"test_id","password":"test_passwordHash","tokenKey":"test_tokenKey","unknown":"test_unknown","verified":true}`,
 		},
 
 		// auth
@@ -1406,7 +1487,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			false,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id","verified":true}`,
+			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id","verified":true}`,
 		},
 		{
 			"[auth] with email visibility",
@@ -1415,7 +1496,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			false,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","email":"test_email","emailVisibility":false,"expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id","verified":true}`,
+			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","email":"test_email","emailVisibility":false,"expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id","verified":true}`,
 		},
 		{
 			"[auth] with custom data",
@@ -1424,7 +1505,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			nil,
 			nil,
-			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"id":"test_id","unknown":"test_unknown","verified":true}`,
+			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field6":{"a":1,"a":2},"id":"test_id","unknown":"test_unknown","verified":true}`,
 		},
 		{
 			"[auth] with explicit hide and unhide fields",
@@ -1433,7 +1514,7 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			[]string{"field3", "field1", "expand", "collectionId", "collectionName", "email", "unknown"},
 			[]string{"field4", "@pbInternalAbc"},
-			`{"emailVisibility":false,"field2":"field_2.png","field4":"field_4","id":"test_id","verified":true}`,
+			`{"emailVisibility":false,"field2":"field_2.png","field4":"field_4","field6":{"a":1,"a":2},"id":"test_id","verified":true}`,
 		},
 		{
 			"[auth] trying to unhide custom fields without explicit WithCustomData",
@@ -1442,17 +1523,18 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			true,
 			nil,
 			[]string{"field5", "@pbInternalAbc", "tokenKey", "unknown", "email"}, // emailVisibility:false has higher priority
-			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1","field2":"field_2.png","field3":["test1","test2"],"field5":"field_5","id":"test_id","unknown":"test_unknown","verified":true}`,
+			`{"collectionId":"_pbc_auth_123","collectionName":"test_auth","emailVisibility":false,"expand":{"test":123},"field1":"field_1�","field2":"field_2.png","field3":["test1","test2"],"field5":"field_5","field6":{"a":1,"a":2},"id":"test_id","unknown":"test_unknown","verified":true}`,
 		},
 	}
 
 	data := map[string]any{
 		"id":              "test_id",
-		"field1":          "field_1",
+		"field1":          "field_1\xc3", /* invalid utf8 suffix to test mangling */
 		"field2":          "field_2.png",
 		"field3":          []string{"test1", "test2"},
 		"field4":          "field_4",
 		"field5":          "field_5",
+		"field6":          types.JSONRaw(`{"a":1,"a":2}`), // intentionally duplicated to check serialization
 		"expand":          map[string]any{"test": 123},
 		"collectionId":    "m_id",   // should be always ignored
 		"collectionName":  "m_name", // should be always ignored
@@ -1475,7 +1557,12 @@ func TestRecordPublicExportAndMarshalJSON(t *testing.T) {
 			m.Unhide(s.unhideFields...)
 			m.Hide(s.hideFields...)
 
-			exportResult, err := json.Marshal(m.PublicExport())
+			exportResult, err := json.Marshal(
+				m.PublicExport(),
+				json.Deterministic(true),
+				jsontext.AllowDuplicateNames(true),
+				jsontext.AllowInvalidUTF8(true),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1616,6 +1703,288 @@ func TestRecordValidate(t *testing.T) {
 		record.Set("f2", 1)
 		tests.TestValidationErrors(t, app.Validate(record), nil)
 	})
+}
+
+func TestRecordModelEventSync(t *testing.T) {
+	t.Parallel()
+
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	col, err := app.FindCollectionByNameOrId("demo3")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testRecords := make([]*core.Record, 4)
+	for i := 0; i < 4; i++ {
+		testRecords[i] = core.NewRecord(col)
+		testRecords[i].Set("title", "sync_test_"+strconv.Itoa(i))
+		if err := app.Save(testRecords[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	createModelEvent := func() *core.ModelEvent {
+		event := new(core.ModelEvent)
+		event.App = app
+		event.Context = context.Background()
+		event.Type = "test_a"
+		event.Model = testRecords[0]
+		return event
+	}
+
+	createModelErrorEvent := func() *core.ModelErrorEvent {
+		event := new(core.ModelErrorEvent)
+		event.ModelEvent = *createModelEvent()
+		event.Error = errors.New("error_a")
+		return event
+	}
+
+	changeRecordEventBefore := func(e *core.RecordEvent) {
+		e.Type = "test_b"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 123)
+		e.Record = testRecords[1]
+	}
+
+	modelEventFinalizerChange := func(e *core.ModelEvent) {
+		e.Type = "test_c"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 456)
+		e.Model = testRecords[2]
+	}
+
+	changeRecordEventAfter := func(e *core.RecordEvent) {
+		e.Type = "test_d"
+		//nolint:staticcheck
+		e.Context = context.WithValue(context.Background(), "test", 789)
+		e.Record = testRecords[3]
+	}
+
+	expectedBeforeModelEventHandlerChecks := func(t *testing.T, e *core.ModelEvent) {
+		if e.Type != "test_a" {
+			t.Fatalf("Expected type %q, got %q", "test_a", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != nil {
+			t.Fatalf("Expected context value %v, got %v", nil, v)
+		}
+
+		if e.Model.PK() != testRecords[0].Id {
+			t.Fatalf("Expected record with id %q, got %q (%d)", testRecords[0].Id, e.Model.PK(), 0)
+		}
+	}
+
+	expectedAfterModelEventHandlerChecks := func(t *testing.T, e *core.ModelEvent) {
+		if e.Type != "test_d" {
+			t.Fatalf("Expected type %q, got %q", "test_d", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != 789 {
+			t.Fatalf("Expected context value %v, got %v", 789, v)
+		}
+
+		// note: currently the Model and Record values are not synced due to performance consideration
+		if e.Model.PK() != testRecords[2].Id {
+			t.Fatalf("Expected record with id %q, got %q (%d)", testRecords[2].Id, e.Model.PK(), 2)
+		}
+	}
+
+	expectedBeforeRecordEventHandlerChecks := func(t *testing.T, e *core.RecordEvent) {
+		if e.Type != "test_a" {
+			t.Fatalf("Expected type %q, got %q", "test_a", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != nil {
+			t.Fatalf("Expected context value %v, got %v", nil, v)
+		}
+
+		if e.Record.Id != testRecords[0].Id {
+			t.Fatalf("Expected record with id %q, got %q (%d)", testRecords[0].Id, e.Record.Id, 2)
+		}
+	}
+
+	expectedAfterRecordEventHandlerChecks := func(t *testing.T, e *core.RecordEvent) {
+		if e.Type != "test_c" {
+			t.Fatalf("Expected type %q, got %q", "test_c", e.Type)
+		}
+
+		if v := e.Context.Value("test"); v != 456 {
+			t.Fatalf("Expected context value %v, got %v", 456, v)
+		}
+
+		// note: currently the Model and Record values are not synced due to performance consideration
+		if e.Record.Id != testRecords[1].Id {
+			t.Fatalf("Expected record with id %q, got %q (%d)", testRecords[1].Id, e.Record.Id, 1)
+		}
+	}
+
+	modelEventFinalizer := func(e *core.ModelEvent) error {
+		modelEventFinalizerChange(e)
+		return nil
+	}
+
+	modelErrorEventFinalizer := func(e *core.ModelErrorEvent) error {
+		modelEventFinalizerChange(&e.ModelEvent)
+		e.Error = errors.New("error_c")
+		return nil
+	}
+
+	modelEventHandler := &hook.Handler[*core.ModelEvent]{
+		Priority: -999,
+		Func: func(e *core.ModelEvent) error {
+			t.Run("before model", func(t *testing.T) {
+				expectedBeforeModelEventHandlerChecks(t, e)
+			})
+
+			_ = e.Next()
+
+			t.Run("after model", func(t *testing.T) {
+				expectedAfterModelEventHandlerChecks(t, e)
+			})
+
+			return nil
+		},
+	}
+
+	modelErrorEventHandler := &hook.Handler[*core.ModelErrorEvent]{
+		Priority: -999,
+		Func: func(e *core.ModelErrorEvent) error {
+			t.Run("before model error", func(t *testing.T) {
+				expectedBeforeModelEventHandlerChecks(t, &e.ModelEvent)
+				if v := e.Error.Error(); v != "error_a" {
+					t.Fatalf("Expected error %q, got %q", "error_a", v)
+				}
+			})
+
+			_ = e.Next()
+
+			t.Run("after model error", func(t *testing.T) {
+				expectedAfterModelEventHandlerChecks(t, &e.ModelEvent)
+				if v := e.Error.Error(); v != "error_d" {
+					t.Fatalf("Expected error %q, got %q", "error_d", v)
+				}
+			})
+
+			return nil
+		},
+	}
+
+	recordEventHandler := &hook.Handler[*core.RecordEvent]{
+		Priority: -999,
+		Func: func(e *core.RecordEvent) error {
+			t.Run("before record", func(t *testing.T) {
+				expectedBeforeRecordEventHandlerChecks(t, e)
+			})
+
+			changeRecordEventBefore(e)
+
+			_ = e.Next()
+
+			t.Run("after record", func(t *testing.T) {
+				expectedAfterRecordEventHandlerChecks(t, e)
+			})
+
+			changeRecordEventAfter(e)
+
+			return nil
+		},
+	}
+
+	recordErrorEventHandler := &hook.Handler[*core.RecordErrorEvent]{
+		Priority: -999,
+		Func: func(e *core.RecordErrorEvent) error {
+			t.Run("before record error", func(t *testing.T) {
+				expectedBeforeRecordEventHandlerChecks(t, &e.RecordEvent)
+				if v := e.Error.Error(); v != "error_a" {
+					t.Fatalf("Expected error %q, got %q", "error_c", v)
+				}
+			})
+
+			changeRecordEventBefore(&e.RecordEvent)
+			e.Error = errors.New("error_b")
+
+			_ = e.Next()
+
+			t.Run("after record error", func(t *testing.T) {
+				expectedAfterRecordEventHandlerChecks(t, &e.RecordEvent)
+				if v := e.Error.Error(); v != "error_c" {
+					t.Fatalf("Expected error %q, got %q", "error_c", v)
+				}
+			})
+
+			changeRecordEventAfter(&e.RecordEvent)
+			e.Error = errors.New("error_d")
+
+			return nil
+		},
+	}
+
+	// OnModelValidate
+	app.OnRecordValidate().Bind(recordEventHandler)
+	app.OnModelValidate().Bind(modelEventHandler)
+	app.OnModelValidate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelCreate
+	app.OnRecordCreate().Bind(recordEventHandler)
+	app.OnModelCreate().Bind(modelEventHandler)
+	app.OnModelCreate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelCreateExecute
+	app.OnRecordCreateExecute().Bind(recordEventHandler)
+	app.OnModelCreateExecute().Bind(modelEventHandler)
+	app.OnModelCreateExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterCreateSuccess
+	app.OnRecordAfterCreateSuccess().Bind(recordEventHandler)
+	app.OnModelAfterCreateSuccess().Bind(modelEventHandler)
+	app.OnModelAfterCreateSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterCreateError
+	app.OnRecordAfterCreateError().Bind(recordErrorEventHandler)
+	app.OnModelAfterCreateError().Bind(modelErrorEventHandler)
+	app.OnModelAfterCreateError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
+
+	// OnModelUpdate
+	app.OnRecordUpdate().Bind(recordEventHandler)
+	app.OnModelUpdate().Bind(modelEventHandler)
+	app.OnModelUpdate().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelUpdateExecute
+	app.OnRecordUpdateExecute().Bind(recordEventHandler)
+	app.OnModelUpdateExecute().Bind(modelEventHandler)
+	app.OnModelUpdateExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterUpdateSuccess
+	app.OnRecordAfterUpdateSuccess().Bind(recordEventHandler)
+	app.OnModelAfterUpdateSuccess().Bind(modelEventHandler)
+	app.OnModelAfterUpdateSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterUpdateError
+	app.OnRecordAfterUpdateError().Bind(recordErrorEventHandler)
+	app.OnModelAfterUpdateError().Bind(modelErrorEventHandler)
+	app.OnModelAfterUpdateError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
+
+	// OnModelDelete
+	app.OnRecordDelete().Bind(recordEventHandler)
+	app.OnModelDelete().Bind(modelEventHandler)
+	app.OnModelDelete().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelDeleteExecute
+	app.OnRecordDeleteExecute().Bind(recordEventHandler)
+	app.OnModelDeleteExecute().Bind(modelEventHandler)
+	app.OnModelDeleteExecute().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterDeleteSuccess
+	app.OnRecordAfterDeleteSuccess().Bind(recordEventHandler)
+	app.OnModelAfterDeleteSuccess().Bind(modelEventHandler)
+	app.OnModelAfterDeleteSuccess().Trigger(createModelEvent(), modelEventFinalizer)
+
+	// OnModelAfterDeleteError
+	app.OnRecordAfterDeleteError().Bind(recordErrorEventHandler)
+	app.OnModelAfterDeleteError().Bind(modelErrorEventHandler)
+	app.OnModelAfterDeleteError().Trigger(createModelErrorEvent(), modelErrorEventFinalizer)
 }
 
 func TestRecordSave(t *testing.T) {
@@ -1932,13 +2301,13 @@ func TestRecordDelete(t *testing.T) {
 	app.NonconcurrentDB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
-	app.DB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
+	app.ConcurrentDB().(*dbx.DB).QueryLogFunc = func(ctx context.Context, t time.Duration, sql string, rows *sql.Rows, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
 	app.NonconcurrentDB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
-	app.DB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
+	app.ConcurrentDB().(*dbx.DB).ExecLogFunc = func(ctx context.Context, t time.Duration, sql string, result sql.Result, err error) {
 		calledQueries = append(calledQueries, sql)
 	}
 	rec3, _ := app.FindRecordById("users", "oap640cot4yru2s")
@@ -1958,13 +2327,102 @@ func TestRecordDelete(t *testing.T) {
 	}
 	// ensure that the json rel fields were prefixed
 	joinedQueries := strings.Join(calledQueries, " ")
-	expectedRelManyPart := "SELECT `demo1`.* FROM `demo1` WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid([[demo1.rel_many]]) THEN [[demo1.rel_many]] ELSE json_array([[demo1.rel_many]]) END) {{__je__}} WHERE [[__je__.value]]='"
+	expectedRelManyPart := "SELECT `demo1`.`id` FROM `demo1` WHERE EXISTS (SELECT 1 FROM json_each(CASE WHEN iif(json_valid([[demo1.rel_many]]), json_type([[demo1.rel_many]])='array', FALSE) THEN [[demo1.rel_many]] ELSE json_array([[demo1.rel_many]]) END) {{__je__}} WHERE [[__je__.value]]='"
 	if !strings.Contains(joinedQueries, expectedRelManyPart) {
 		t.Fatalf("(rec3) Expected the cascade delete to call the query \n%v, got \n%v", expectedRelManyPart, calledQueries)
 	}
-	expectedRelOnePart := "SELECT `demo1`.* FROM `demo1` WHERE (`demo1`.`rel_one`='"
+	expectedRelOnePart := "SELECT `demo1`.`id` FROM `demo1` WHERE (`demo1`.`rel_one`='"
 	if !strings.Contains(joinedQueries, expectedRelOnePart) {
 		t.Fatalf("(rec3) Expected the cascade delete to call the query \n%v, got \n%v", expectedRelOnePart, calledQueries)
+	}
+}
+
+func TestRecordDeleteWithMultipleRelationCascade(t *testing.T) {
+	t.Parallel()
+
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	// create a mock collection with self referencing multiple relation field
+	// ---
+	collection := core.NewBaseCollection("test")
+	err := app.Save(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// for simpler mocks
+	collection.Fields.GetByName("id").(*core.TextField).Min = 1
+
+	collection.Fields.Add(&core.RelationField{
+		Name:          "rels",
+		CollectionId:  collection.Id,
+		MaxSelect:     99,
+		CascadeDelete: true,
+	})
+
+	err = app.Save(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create mock records
+	// ---
+	relsData := map[string][]string{
+		"a": nil,
+		"b": {"a"},
+		"c": {"a", "b"},
+		"d": {},
+		"e": {"c", "d"},
+	}
+	for id, rels := range relsData {
+		record := core.NewRecord(collection)
+		record.Set("id", id)
+		record.Set("rels", rels)
+		err = app.SaveNoValidate(record) // map is not ordered
+		if err != nil {
+			t.Fatalf("failed to create mock record: %v", err)
+		}
+	}
+
+	// trigger cascade delete for the top record
+	// ---
+	aRecord, err := app.FindRecordById(collection, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = app.Delete(aRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// verify cascade delete
+	// ---
+	expectedRels := map[string][]string{
+		"d": {},
+		"e": {"d"},
+	}
+
+	allRecords, err := app.FindAllRecords(collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(allRecords) != len(expectedRels) {
+		t.Fatalf("Expected %d remaining records, got %d", len(expectedRels), len(allRecords))
+	}
+
+	for _, r := range allRecords {
+		expected, ok := expectedRels[r.Id]
+		if !ok {
+			t.Fatalf("Record %q wasn't found in %v", r.Id, expectedRels)
+		}
+
+		rels := r.GetStringSlice("rels")
+		if !slices.Equal(rels, expected) {
+			t.Fatalf("Record %q expected rels\n%v\ngot\n%v", r.Id, expected, rels)
+		}
 	}
 }
 

@@ -3,7 +3,7 @@ package apis
 import (
 	"time"
 
-	validation "github.com/go-ozzo/ozzo-validation/v4"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -26,15 +26,15 @@ func recordAuthImpersonate(e *core.RequestEvent) error {
 
 	form := &impersonateForm{}
 	if err = e.BindBody(form); err != nil {
-		return firstApiError(err, e.BadRequestError("An error occurred while loading the submitted data.", err))
+		return e.BadRequestError("An error occurred while loading the submitted data.", err)
 	}
 	if err = form.validate(); err != nil {
-		return firstApiError(err, e.BadRequestError("An error occurred while validating the submitted data.", err))
+		return e.BadRequestError("An error occurred while validating the submitted data.", err)
 	}
 
 	token, err := record.NewStaticAuthToken(time.Duration(form.Duration) * time.Second)
 	if err != nil {
-		e.InternalServerError("Failed to generate static auth token", err)
+		return e.InternalServerError("Failed to generate static auth token", err)
 	}
 
 	return recordAuthResponse(e, record, token, "", nil)

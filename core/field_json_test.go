@@ -102,6 +102,16 @@ func TestJSONFieldValidateValue(t *testing.T) {
 			true,
 		},
 		{
+			"invalid raw value (v2 semantics)",
+			&core.JSONField{Name: "test"},
+			func() *core.Record {
+				record := core.NewRecord(collection)
+				record.SetRaw("test", types.JSONRaw(`{"a": 1, "a": 2}`))
+				return record
+			},
+			true,
+		},
+		{
 			"zero field value (not required)",
 			&core.JSONField{Name: "test"},
 			func() *core.Record {
@@ -146,7 +156,7 @@ func TestJSONFieldValidateValue(t *testing.T) {
 			&core.JSONField{Name: "test"},
 			func() *core.Record {
 				record := core.NewRecord(collection)
-				record.SetRaw("test", types.JSONRaw(`"`+strings.Repeat("a", (5<<20))+`"`))
+				record.SetRaw("test", types.JSONRaw(`"`+strings.Repeat("a", (1<<20))+`"`))
 				return record
 			},
 			true,
@@ -188,6 +198,7 @@ func TestJSONFieldValidateValue(t *testing.T) {
 func TestJSONFieldValidateSettings(t *testing.T) {
 	testDefaultFieldIdValidation(t, core.FieldTypeJSON)
 	testDefaultFieldNameValidation(t, core.FieldTypeJSON)
+	testDefaultFieldHelpValidation[core.JSONField](t)
 
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()

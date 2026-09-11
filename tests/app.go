@@ -147,6 +147,7 @@ func NewTestAppWithConfig(config core.BaseAppConfig) (*TestApp, error) {
 	t.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(e *core.ServeEvent) error {
 			t.registerEventCall("OnServe")
+			e.InstallerFunc = nil // https://github.com/pocketbase/pocketbase/discussions/7202
 			return e.Next()
 		},
 		Priority: -99999,
@@ -547,6 +548,21 @@ func NewTestAppWithConfig(config core.BaseAppConfig) (*TestApp, error) {
 		},
 		Priority: -99999,
 	})
+
+	// t.OnFilesystemDelete().Bind(&hook.Handler[*core.FilesystemDeleteEvent]{
+	// 	Func: func(e *core.FilesystemDeleteEvent) error {
+	// 		t.registerEventCall("OnFilesystemDelete")
+	// 		return e.Next()
+	// 	},
+	// 	Priority: -99999,
+	// })
+	// t.OnFilesystemNewWriter().Bind(&hook.Handler[*core.FilesystemNewWriterEvent]{
+	// 	Func: func(e *core.FilesystemNewWriterEvent) error {
+	// 		t.registerEventCall("OnFilesystemNewWriter")
+	// 		return e.Next()
+	// 	},
+	// 	Priority: -99999,
+	// })
 
 	t.OnRealtimeConnectRequest().Bind(&hook.Handler[*core.RealtimeConnectRequestEvent]{
 		Func: func(e *core.RealtimeConnectRequestEvent) error {

@@ -2,7 +2,7 @@ package s3blob_test
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -100,28 +100,38 @@ func TestDriverNormilizeError(t *testing.T) {
 			false,
 		},
 		{
+			"response error with only status (non-404)",
+			&s3.ResponseError{Status: 123},
+			false,
+		},
+		{
+			"response error with only status (404)",
+			&s3.ResponseError{Status: 404},
+			true,
+		},
+		{
 			"response error with custom code",
-			s3.ResponseError{Code: "test"},
+			&s3.ResponseError{Code: "test"},
 			false,
 		},
 		{
 			"response error with NoSuchBucket code",
-			s3.ResponseError{Code: "NoSuchBucket"},
+			&s3.ResponseError{Code: "NoSuchBucket"},
 			true,
 		},
 		{
 			"response error with NoSuchKey code",
-			s3.ResponseError{Code: "NoSuchKey"},
+			&s3.ResponseError{Code: "NoSuchKey"},
 			true,
 		},
 		{
 			"response error with NotFound code",
-			s3.ResponseError{Code: "NotFound"},
+			&s3.ResponseError{Code: "NotFound"},
 			true,
 		},
 		{
 			"wrapped response error with NotFound code", // ensures that the entire error's tree is checked
-			fmt.Errorf("test: %w", s3.ResponseError{Code: "NotFound"}),
+			fmt.Errorf("test: %w", &s3.ResponseError{Code: "NotFound"}),
 			true,
 		},
 		{
@@ -251,7 +261,11 @@ func TestDriverAttributes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, err := json.Marshal(attrs)
+	raw, err := json.Marshal(
+		attrs,
+		json.Deterministic(true),
+		json.FormatNilSliceAsNull(true),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +366,11 @@ func TestDriverListPaged(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			raw, err := json.Marshal(page)
+			raw, err := json.Marshal(
+				page,
+				json.Deterministic(true),
+				json.FormatNilSliceAsNull(true),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -500,7 +518,11 @@ func TestDriverNewRangeReader(t *testing.T) {
 				}
 			}
 
-			rawAttrs, err := json.Marshal(r.Attributes())
+			rawAttrs, err := json.Marshal(
+				r.Attributes(),
+				json.Deterministic(true),
+				json.FormatNilSliceAsNull(true),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
